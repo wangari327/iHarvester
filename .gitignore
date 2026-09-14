@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.mtproto-recovery-venv/
 .env
 *.session
 *.session-journal
