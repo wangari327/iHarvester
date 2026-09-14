@@ -22,7 +22,7 @@ from typing import Any
 from pymongo import MongoClient
 
 try:
-    from telethon import TelegramClient, errors
+    from telethon import TelegramClient, errors, functions, types
 except ImportError as error:  # pragma: no cover - exercised by the operator
     raise SystemExit(
         "Telethon is required for MTProto recovery. Run: python -m pip install -r requirements-mtproto-recovery.txt"
@@ -163,7 +163,11 @@ async def _delete_target(client: TelegramClient, target: CleanupTarget) -> None:
             raise RuntimeError(
                 f"@{target.username} resolved to a different channel; refusing to delete the tracked post."
             ) from None
-    await client.delete_messages(entity, list(target.message_ids), revoke=True)
+    # Telethon's convenience helper chooses a generic deletion method for
+    # some cached peer shapes.  This recovery is exclusively for channels, so
+    # explicitly call the channel endpoint that accepts an InputChannel.
+    channel = types.InputChannel(entity.channel_id, entity.access_hash)
+    await client(functions.channels.DeleteMessagesRequest(channel, list(target.message_ids)))
 
 
 async def run(args: argparse.Namespace) -> int:
