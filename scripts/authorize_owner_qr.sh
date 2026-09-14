@@ -13,6 +13,16 @@ read -r -p "Telegram API ID: " TELEGRAM_API_ID
 read -r -s -p "Telegram API hash: " TELEGRAM_API_HASH
 echo
 
+if [[ ! "$TELEGRAM_API_ID" =~ ^[0-9]+$ ]]; then
+  echo "The API ID must contain digits only." >&2
+  exit 2
+fi
+if [[ ! "$TELEGRAM_API_HASH" =~ ^[0-9A-Fa-f]{32}$ ]]; then
+  echo "The API hash must be a 32-character hexadecimal value." >&2
+  exit 2
+fi
+echo "Credentials accepted. Preparing the QR login…"
+
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 session_dir="${IHARVESTER_RECOVERY_SESSION_DIR:-$HOME/iharvester-recovery/session}"
 install -d -m 700 "$session_dir"
