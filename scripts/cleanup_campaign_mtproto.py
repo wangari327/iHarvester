@@ -1,4 +1,4 @@
-"""Recover campaign posts with the iHarvester bot's MTProto identity.
+"""Recover campaign posts with an iHarvester bot or human-admin MTProto session.
 
 Run this on the owner's workstation, never as part of the hosted service. It
 does not search channel history or match post text: Mongo's campaign live-state
@@ -37,6 +37,10 @@ class CleanupTarget:
     channel_id: int
     message_ids: tuple[int, ...]
     username: str | None = None
+
+
+class ChannelUnavailableError(RuntimeError):
+    """The current user session has no MTProto access hash for this channel."""
 
 
 def _required_env(name: str) -> str:
@@ -145,17 +149,21 @@ def _record_failure(database: Any, campaign_id: str, target: CleanupTarget, erro
     )
 
 
-async def _delete_target(client: TelegramClient, target: CleanupTarget) -> None:
+async def _delete_target(
+    client: TelegramClient,
+    target: CleanupTarget,
+    *,
+    allow_public_username: bool,
+) -> None:
     # ``delete_messages`` resolves to Telegram's channels.deleteMessages for
     # channels. It receives exact IDs from campaign state—there is no forward
     # or backward channel-history iteration and no risk of matching new posts.
     try:
         entity = await client.get_input_entity(target.channel_id)
     except ValueError:
-        if not target.username:
-            raise RuntimeError(
-                "The bot has no cached MTProto access hash for this private channel. "
-                "Leave it for a human-admin recovery session."
+        if not allow_public_username or not target.username:
+            raise ChannelUnavailableError(
+                "This session has no cached MTProto access hash for the channel."
             ) from None
         entity = await client.get_input_entity(target.username)
         expected_channel_id = -target.channel_id - 1_000_000_000_000
@@ -175,7 +183,7 @@ async def run(args: argparse.Namespace) -> int:
     database_name = os.environ.get("MONGODB_DB_NAME", "telegram_campaign_orchestrator")
     api_id = int(_required_env("TELEGRAM_API_ID"))
     api_hash = _required_env("TELEGRAM_API_HASH")
-    bot_token = _required_env("BOT_TOKEN")
+    bot_token = _required_env("BOT_TOKEN") if args.identity == "bot" else None
     mongo = MongoClient(mongo_uri, tz_aware=True)
     database = mongo[database_name]
     try:
@@ -214,25 +222,47 @@ async def run(args: argparse.Namespace) -> int:
             flood_sleep_threshold=120,
             request_retries=5,
         )
-        await client.start(bot_token=bot_token)
+        if args.identity == "bot":
+            await client.start(bot_token=bot_token)
+        else:
+            # This must already be an authorized local session. Use the QR
+            # helper, never phone codes or passwords in a deployment config.
+            await client.start()
         identity = await client.get_me()
-        if not identity or not identity.bot:
+        if not identity:
+            raise SystemExit("Could not determine the MTProto identity.")
+        if args.identity == "bot" and not identity.bot:
             raise SystemExit("The configured BOT_TOKEN did not authenticate as a bot. Refusing to use a personal account.")
+        if args.identity == "user" and identity.bot:
+            raise SystemExit("The selected session is a bot. Use --identity bot or authorize a human admin account.")
+        if args.identity == "user":
+            logger.info("Loading this human admin's channel directory (no message history is scanned).")
+            await client.get_dialogs(limit=None)
         logger.info(
-            "Authenticated as @%s. Starting exact-ID deletion at %.1f requests/sec%s.",
+            "Authenticated as @%s (%s). Starting exact-ID deletion at %.1f requests/sec%s.",
             identity.username or identity.id,
+            args.identity,
             args.rps,
             " (public channels only)" if args.public_only else "",
         )
 
         deleted = 0
         failed = 0
+        skipped = 0
         delay = 1 / args.rps
         try:
             for index, target in enumerate(targets, start=1):
                 failure: Exception | None = None
                 try:
-                    await _delete_target(client, target)
+                    await _delete_target(
+                        client,
+                        target,
+                        allow_public_username=args.identity == "bot",
+                    )
+                except ChannelUnavailableError:
+                    skipped += 1
+                    logger.debug("%s/%s channel %s is not in this account's directory", index, len(targets), target.channel_id)
+                    continue
                 except errors.MsgIdInvalidError:
                     # A post deleted manually after Mongo recorded it is
                     # already clean. This is the MTProto equivalent of the
@@ -242,7 +272,11 @@ async def run(args: argparse.Namespace) -> int:
                     logger.warning("Flood wait at channel %s; sleeping %s seconds", target.channel_id, error.seconds)
                     await asyncio.sleep(error.seconds)
                     try:
-                        await _delete_target(client, target)
+                        await _delete_target(
+                            client,
+                            target,
+                            allow_public_username=args.identity == "bot",
+                        )
                     except Exception as retry_error:
                         failure = retry_error
                 except Exception as error:
@@ -258,18 +292,29 @@ async def run(args: argparse.Namespace) -> int:
                 await asyncio.sleep(delay)
         finally:
             await client.disconnect()
-        logger.info("Finished: %s channels reconciled, %s failed. Refresh the campaign dashboard.", deleted, failed)
+        logger.info(
+            "Finished: %s channels reconciled, %s failed, %s not in this session. Refresh the campaign dashboard.",
+            deleted,
+            failed,
+            skipped,
+        )
         return 0 if not failed else 2
     finally:
         mongo.close()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Delete iHarvester's exact tracked campaign posts with the bot's MTProto identity.")
+    parser = argparse.ArgumentParser(description="Delete iHarvester's exact tracked campaign posts with an MTProto identity.")
     parser.add_argument("--campaign", required=True, help="Campaign ID, for example cmp_xxxxx")
     parser.add_argument("--confirm", action="store_true", help="Perform deletion. Omit this flag for a dry run.")
     parser.add_argument("--limit", type=int, help="Process only the first N channels; use 10 for the pilot.")
     parser.add_argument("--rps", type=float, default=4, help="Maximum MTProto requests per second (default: 4).")
+    parser.add_argument(
+        "--identity",
+        choices=("bot", "user"),
+        default="bot",
+        help="Use the iHarvester bot (default) or an already-authorized human admin session.",
+    )
     parser.add_argument(
         "--public-only",
         action="store_true",
@@ -285,6 +330,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--limit must be at least 1")
     if args.rps <= 0 or args.rps > 10:
         parser.error("--rps must be greater than 0 and no more than 10")
+    if args.public_only and args.identity != "bot":
+        parser.error("--public-only is only available with --identity bot")
     return args
 
 

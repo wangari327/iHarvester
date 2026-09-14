@@ -3,3 +3,4 @@
 # a one-off, owner-initiated cleanup of posts that the Bot API can no longer
 # remove.
 telethon>=1.45,<2
+qrcode>=8,<9
