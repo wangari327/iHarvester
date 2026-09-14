@@ -107,6 +107,26 @@ def _targets(
     return targets
 
 
+def _limited(targets: list[CleanupTarget], limit: int | None) -> list[CleanupTarget]:
+    return targets if limit is None else targets[:limit]
+
+
+async def _account_channel_ids(client: TelegramClient) -> set[int]:
+    """Return Bot API-shaped IDs for channels in a human account's dialogs."""
+
+    dialogs = await client.get_dialogs(limit=None)
+    channel_ids: set[int] = set()
+    for dialog in dialogs:
+        try:
+            entity = await client.get_input_entity(dialog.entity)
+        except ValueError:
+            continue
+        mtproto_channel_id = getattr(entity, "channel_id", None)
+        if isinstance(mtproto_channel_id, int):
+            channel_ids.add(-1_000_000_000_000 - mtproto_channel_id)
+    return channel_ids
+
+
 def _mark_cleaned(database: Any, campaign_id: str, target: CleanupTarget) -> None:
     now = datetime.now(UTC)
     database.campaign_channel_state.delete_one({"campaign_id": campaign_id, "channel_id": target.channel_id})
@@ -192,25 +212,15 @@ async def run(args: argparse.Namespace) -> int:
             raise SystemExit("Campaign not found. Copy its campaign ID from the bot's report/export.")
         if campaign.get("status") not in {"ENDING", "ARCHIVED"}:
             raise SystemExit("MTProto recovery only accepts an ENDING or ARCHIVED campaign; stop it first.")
-        targets = _targets(database, args.campaign, args.limit, public_only=args.public_only)
-        message_total = sum(len(target.message_ids) for target in targets)
-        logger.info(
-            "Campaign %s (%s): %s channels, %s exact message IDs%s",
+        # A human account has to be matched to its own directory before the
+        # pilot limit is applied. A bot can only resolve public usernames, so
+        # it keeps the prior direct target selection.
+        targets = _targets(
+            database,
             args.campaign,
-            campaign.get("name", "unnamed"),
-            len(targets),
-            message_total,
-            " [DRY RUN]" if not args.confirm else "",
+            None if args.identity == "user" else args.limit,
+            public_only=args.public_only,
         )
-        if not args.confirm:
-            for target in targets[:20]:
-                logger.info("Would delete channel %s message IDs %s", target.channel_id, list(target.message_ids))
-            if len(targets) > 20:
-                logger.info("… and %s more channels", len(targets) - 20)
-            return 0
-        if not targets:
-            logger.info("No tracked live posts remain for this campaign.")
-            return 0
 
         session = Path(args.session).expanduser().resolve()
         session.parent.mkdir(parents=True, exist_ok=True)
@@ -237,7 +247,26 @@ async def run(args: argparse.Namespace) -> int:
             raise SystemExit("The selected session is a bot. Use --identity bot or authorize a human admin account.")
         if args.identity == "user":
             logger.info("Loading this human admin's channel directory (no message history is scanned).")
-            await client.get_dialogs(limit=None)
+            account_channel_ids = await _account_channel_ids(client)
+            campaign_targets = len(targets)
+            targets = _limited(
+                [target for target in targets if target.channel_id in account_channel_ids],
+                args.limit,
+            )
+            logger.info(
+                "This account matches %s of %s tracked campaign channels.",
+                len(targets),
+                campaign_targets,
+            )
+        message_total = sum(len(target.message_ids) for target in targets)
+        logger.info(
+            "Campaign %s (%s): %s channels, %s exact message IDs%s",
+            args.campaign,
+            campaign.get("name", "unnamed"),
+            len(targets),
+            message_total,
+            " [DRY RUN]" if not args.confirm else "",
+        )
         logger.info(
             "Authenticated as @%s (%s). Starting exact-ID deletion at %.1f requests/sec%s.",
             identity.username or identity.id,
@@ -245,6 +274,17 @@ async def run(args: argparse.Namespace) -> int:
             args.rps,
             " (public channels only)" if args.public_only else "",
         )
+        if not targets:
+            logger.info("No matching tracked live posts remain for this identity.")
+            await client.disconnect()
+            return 0
+        if not args.confirm:
+            for target in targets[:20]:
+                logger.info("Would delete channel %s message IDs %s", target.channel_id, list(target.message_ids))
+            if len(targets) > 20:
+                logger.info("… and %s more channels", len(targets) - 20)
+            await client.disconnect()
+            return 0
 
         deleted = 0
         failed = 0
