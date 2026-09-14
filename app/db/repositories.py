@@ -452,6 +452,15 @@ class Repositories:
     async def live_states(self, campaign_id: str) -> list[Document]:
         return await self.db.campaign_channel_state.find({"campaign_id": campaign_id}).to_list(None)
 
+    async def oldest_live_state_updated_at(self, campaign_id: str) -> Any | None:
+        """Oldest confirmed campaign post, used to stay inside Telegram's delete window."""
+        state = await self.db.campaign_channel_state.find_one(
+            {"campaign_id": campaign_id},
+            {"updated_at": 1},
+            sort=[("updated_at", ASCENDING)],
+        )
+        return state.get("updated_at") if state else None
+
     async def mark_campaign_archived(self, campaign_id: str, reason: str) -> None:
         await self.db.campaigns.update_one(
             {"campaign_id": campaign_id},

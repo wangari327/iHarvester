@@ -134,7 +134,10 @@ def _cleanup_guidance(category: str | None) -> str:
     """Human action for a cleanup failure; unknown categories stay honest."""
     guidance = {
         "ACCESS_OR_PERMISSION": "Restore the bot's channel admin/delete access, then use Retry cleanup.",
-        "DELETE_NOT_ALLOWED": "Telegram refused that deletion. The tracked post remains; open the channel and remove it manually if Telegram still permits it.",
+        "DELETE_NOT_ALLOWED": (
+            "Telegram refused that deletion, usually because the post is over its 48-hour Bot API deletion limit. "
+            "The tracked post remains; remove it manually if Telegram still permits it."
+        ),
         "RETRY_EXHAUSTED": "A temporary error exhausted its first retry round. The bot will retry later; Retry cleanup runs it now.",
         "ALREADY_ABSENT": "The post was already removed manually; the bot will reconcile it as cleaned.",
     }

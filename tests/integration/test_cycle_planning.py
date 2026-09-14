@@ -18,12 +18,17 @@ class MemoryRepositories:
         self.ending = []
         self.paused_deliveries = 0
         self.resumed_deliveries = 0
+        self.oldest_live_at = None
 
     async def active_channels(self, selector):
         return self.sources
 
     async def get_campaign(self, campaign_id):
         return self.campaign if campaign_id == self.campaign["campaign_id"] else None
+
+    async def oldest_live_state_updated_at(self, campaign_id):
+        assert campaign_id == self.campaign["campaign_id"]
+        return self.oldest_live_at
 
     async def create_cycle(self, cycle, deliveries):
         if not any(existing["cycle_number"] == cycle["cycle_number"] for existing in self.cycles):
@@ -151,6 +156,39 @@ async def test_2000_channel_cycle_is_bounded_excludes_destination_and_changes_or
     second_order = [item["channel_id"] for item in sorted(second, key=lambda item: item["dispatch_rank"])]
     assert first_order != second_order
     assert max(delivery["cohort_index"] for delivery in second) == 2
+
+
+@pytest.mark.asyncio
+async def test_scheduler_refreshes_an_ageing_post_before_telegram_cleanup_expires() -> None:
+    now = datetime.now(UTC)
+    start = now - timedelta(hours=45)
+    campaign = {
+        "campaign_id": "cmp_cleanup_safety",
+        "status": "ACTIVE",
+        "mode": "STANDARD",
+        "start_at_utc": start,
+        "current_end_at_utc": now + timedelta(hours=4),
+        "repost_interval_seconds": 47 * 60 * 60,
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"x" * 32).decode(),
+        "variants": [{"id": "var_1", "kind": "TEXT", "text": "Fresh post"}],
+        "next_cycle_number": 1,
+        "delete_on_end": True,
+    }
+    repositories = MemoryRepositories(campaign, [{"telegram_chat_id": -1001}])
+    repositories.oldest_live_at = now - timedelta(hours=45)
+
+    assert await CampaignService(repositories, send_rps=20).plan_due_cycle(campaign, now)
+
+    assert repositories.deliveries[0]["cycle_number"] == 1
+    assert repositories.deliveries[0]["safety_refresh"] is True
+    assert repositories.cycles[0]["scheduled_at_utc"] == now
+    assert campaign["cleanup_safety_refresh_count"] == 1
+    # The previous scheduled cycle was deliberately consumed by the fresh
+    # safety post, so stale missed reposts are not dumped into the network.
+    assert campaign["next_cycle_number"] == 2
+    assert campaign["next_cycle_at"] == campaign["current_end_at_utc"]
 
 
 @pytest.mark.asyncio

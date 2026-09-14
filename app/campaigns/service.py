@@ -20,6 +20,11 @@ from app.utils.time import as_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
+# Telegram's Bot API rejects deletion once a message reaches 48 hours. Leave
+# enough time to replace posts across a large channel network and to recover
+# from a short worker outage before that hard limit.
+_CLEANUP_REFRESH_LEAD = timedelta(hours=2)
+
 
 class CampaignService:
     def __init__(self, repositories: Repositories, send_rps: float) -> None:
@@ -321,19 +326,26 @@ class CampaignService:
             return False
         cycle_number = int(campaign.get("next_cycle_number", 0))
         repost_offsets = campaign.get("repost_offsets_seconds")
+        safety_refresh = await self._cleanup_safety_refresh_due(campaign, now, end)
         # After a one-off or final specific repost, keep the campaign active
         # until its configured end so cleanup can run. There is simply no
-        # further cycle to plan before then.
+        # further cycle to plan before then, unless a confirmed live post is
+        # nearing Telegram's hard deletion age and must be refreshed first.
         if (repost_offsets is not None and cycle_number > len(repost_offsets)) or (
             repost_offsets is None and not campaign.get("repost_interval_seconds") and cycle_number > 0
         ):
+            if not safety_refresh:
+                return False
+            expected = now
+        else:
+            expected = scheduled_cycle_time(start, cycle_number, campaign.get("repost_interval_seconds"), repost_offsets)
+        if not safety_refresh and now < expected:
             return False
-        expected = scheduled_cycle_time(start, cycle_number, campaign.get("repost_interval_seconds"), repost_offsets)
-        if now < expected:
-            return False
-        if not can_create_cycle(start, end, cycle_number, campaign.get("repost_interval_seconds"), repost_offsets):
+        if not safety_refresh and not can_create_cycle(start, end, cycle_number, campaign.get("repost_interval_seconds"), repost_offsets):
             await self.repositories.mark_campaign_ending(campaign["campaign_id"], "schedule_complete")
             return False
+        if safety_refresh:
+            expected = now
         seed = base64.urlsafe_b64decode(campaign["shuffle_seed"])
         variant_count = len(campaign["variants"])
         deliveries: list[Document] = []
@@ -360,6 +372,7 @@ class CampaignService:
                     "worker_id": None,
                     "lease_until": None,
                     "next_retry_at": None,
+                    "safety_refresh": safety_refresh,
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -378,7 +391,27 @@ class CampaignService:
             deliveries,
         )
         interval = campaign.get("repost_interval_seconds")
-        if repost_offsets is not None:
+        if safety_refresh:
+            next_cycle, next_cycle_at = self._next_cycle_after_now(
+                start,
+                end,
+                cycle_number,
+                interval,
+                repost_offsets,
+                now,
+            )
+            await self.repositories.advance_running_campaign(
+                campaign["campaign_id"],
+                {
+                    "status": CampaignStatus.ACTIVE.value,
+                    "next_cycle_number": next_cycle,
+                    "next_cycle_at": next_cycle_at,
+                    "cleanup_safety_refresh_count": int(campaign.get("cleanup_safety_refresh_count", 0)) + 1,
+                    "cleanup_safety_last_refresh_at": now,
+                    "updated_at": now,
+                },
+            )
+        elif repost_offsets is not None:
             next_cycle = cycle_number + 1
             next_cycle_at = scheduled_cycle_time(start, next_cycle, interval, repost_offsets) if next_cycle <= len(repost_offsets) else end
             await self.repositories.advance_running_campaign(
@@ -412,6 +445,51 @@ class CampaignService:
                 },
             )
         return True
+
+    async def _cleanup_safety_refresh_due(self, campaign: Document, now: Any, end: Any) -> bool:
+        """Return whether an ageing live post needs an early replacement.
+
+        The normal schedule is preferred. This only intervenes if the planned
+        campaign end lies beyond the oldest live post's safe deletion deadline
+        and that deadline is within the two-hour dispatch buffer.
+        """
+        if not campaign.get("delete_on_end", True):
+            return False
+        oldest_live_at = await self.repositories.oldest_live_state_updated_at(campaign["campaign_id"])
+        if not oldest_live_at:
+            return False
+        safe_deadline = as_utc(oldest_live_at) + SAFE_DELETE_WINDOW
+        return as_utc(end) > safe_deadline and now >= safe_deadline - _CLEANUP_REFRESH_LEAD
+
+    @staticmethod
+    def _next_cycle_after_now(
+        start: Any,
+        end: Any,
+        cycle_number: int,
+        interval: int | None,
+        repost_offsets: list[int] | None,
+        now: Any,
+    ) -> tuple[int, Any]:
+        """Skip stale scheduled reposts after a safety refresh.
+
+        Catching every missed cycle after a long outage would immediately
+        replace a newly refreshed post several times and overload the channel
+        network. Resume at the first planned cycle that is still in the future.
+        """
+        next_cycle = cycle_number + 1
+        if repost_offsets is not None:
+            while next_cycle <= len(repost_offsets):
+                next_at = scheduled_cycle_time(start, next_cycle, interval, repost_offsets)
+                if next_at > now:
+                    return next_cycle, next_at
+                next_cycle += 1
+            return next_cycle, end
+        if interval:
+            elapsed = max(0, int((now - start).total_seconds()))
+            next_cycle = max(next_cycle, elapsed // int(interval) + 1)
+            next_at = scheduled_cycle_time(start, next_cycle, interval, None)
+            return next_cycle, next_at if next_at < end else end
+        return next_cycle, end
 
     async def replace_running_variant(
         self,
