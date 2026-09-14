@@ -36,6 +36,7 @@ logger = logging.getLogger("iharvester.mtproto_cleanup")
 class CleanupTarget:
     channel_id: int
     message_ids: tuple[int, ...]
+    username: str | None = None
 
 
 def _required_env(name: str) -> str:
@@ -45,18 +46,60 @@ def _required_env(name: str) -> str:
     return value
 
 
-def _targets(database: Any, campaign_id: str, limit: int | None) -> list[CleanupTarget]:
-    rows = database.campaign_channel_state.find(
-        {"campaign_id": campaign_id},
-        {"_id": 0, "channel_id": 1, "current_message_ids": 1},
-    ).sort("channel_id", 1)
-    if limit is not None:
-        rows = rows.limit(limit)
+def _targets(
+    database: Any,
+    campaign_id: str,
+    limit: int | None,
+    *,
+    public_only: bool = False,
+) -> list[CleanupTarget]:
+    """Return exact live posts, including their stored public usernames.
+
+    MTProto bot sessions cannot enumerate their dialogs, so bare Bot API chat
+    IDs have no access hash to resolve. Public usernames discovered by the bot
+    can be resolved one at a time without reading message history. Private
+    channels remain untouched when ``public_only`` is requested.
+    """
+
+    rows = database.campaign_channel_state.aggregate(
+        [
+            {"$match": {"campaign_id": campaign_id}},
+            {"$sort": {"channel_id": 1}},
+            {
+                "$lookup": {
+                    "from": "channels",
+                    "localField": "channel_id",
+                    "foreignField": "telegram_chat_id",
+                    "as": "channel",
+                }
+            },
+            {"$unwind": {"path": "$channel", "preserveNullAndEmptyArrays": True}},
+            {
+                "$project": {
+                    "_id": 0,
+                    "channel_id": 1,
+                    "current_message_ids": 1,
+                    "username": "$channel.username",
+                }
+            },
+        ]
+    )
     targets: list[CleanupTarget] = []
     for row in rows:
         message_ids = tuple(sorted({int(value) for value in row.get("current_message_ids", []) if int(value) > 0}))
-        if message_ids:
-            targets.append(CleanupTarget(channel_id=int(row["channel_id"]), message_ids=message_ids))
+        username = row.get("username")
+        if not isinstance(username, str) or not username.strip():
+            username = None
+        if message_ids and (username or not public_only):
+            targets.append(
+                CleanupTarget(
+                    channel_id=int(row["channel_id"]),
+                    message_ids=message_ids,
+                    username=username,
+                )
+            )
+            if limit is not None and len(targets) >= limit:
+                break
     return targets
 
 
@@ -106,7 +149,20 @@ async def _delete_target(client: TelegramClient, target: CleanupTarget) -> None:
     # ``delete_messages`` resolves to Telegram's channels.deleteMessages for
     # channels. It receives exact IDs from campaign state—there is no forward
     # or backward channel-history iteration and no risk of matching new posts.
-    entity = await client.get_input_entity(target.channel_id)
+    try:
+        entity = await client.get_input_entity(target.channel_id)
+    except ValueError:
+        if not target.username:
+            raise RuntimeError(
+                "The bot has no cached MTProto access hash for this private channel. "
+                "Leave it for a human-admin recovery session."
+            ) from None
+        entity = await client.get_input_entity(target.username)
+        expected_channel_id = -target.channel_id - 1_000_000_000_000
+        if getattr(entity, "channel_id", None) != expected_channel_id:
+            raise RuntimeError(
+                f"@{target.username} resolved to a different channel; refusing to delete the tracked post."
+            ) from None
     await client.delete_messages(entity, list(target.message_ids), revoke=True)
 
 
@@ -124,7 +180,7 @@ async def run(args: argparse.Namespace) -> int:
             raise SystemExit("Campaign not found. Copy its campaign ID from the bot's report/export.")
         if campaign.get("status") not in {"ENDING", "ARCHIVED"}:
             raise SystemExit("MTProto recovery only accepts an ENDING or ARCHIVED campaign; stop it first.")
-        targets = _targets(database, args.campaign, args.limit)
+        targets = _targets(database, args.campaign, args.limit, public_only=args.public_only)
         message_total = sum(len(target.message_ids) for target in targets)
         logger.info(
             "Campaign %s (%s): %s channels, %s exact message IDs%s",
@@ -158,12 +214,12 @@ async def run(args: argparse.Namespace) -> int:
         identity = await client.get_me()
         if not identity or not identity.bot:
             raise SystemExit("The configured BOT_TOKEN did not authenticate as a bot. Refusing to use a personal account.")
-        # A bare channel ID needs an MTProto access hash. Loading the bot's
-        # dialogs once fills Telethon's entity cache for all of the channels
-        # where it is currently a member, without reading any post history.
-        logger.info("Loading the bot's channel directory (no message history is read)…")
-        await client.get_dialogs(limit=None)
-        logger.info("Authenticated as @%s. Starting exact-ID deletion at %.1f requests/sec.", identity.username or identity.id, args.rps)
+        logger.info(
+            "Authenticated as @%s. Starting exact-ID deletion at %.1f requests/sec%s.",
+            identity.username or identity.id,
+            args.rps,
+            " (public channels only)" if args.public_only else "",
+        )
 
         deleted = 0
         failed = 0
@@ -210,6 +266,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confirm", action="store_true", help="Perform deletion. Omit this flag for a dry run.")
     parser.add_argument("--limit", type=int, help="Process only the first N channels; use 10 for the pilot.")
     parser.add_argument("--rps", type=float, default=4, help="Maximum MTProto requests per second (default: 4).")
+    parser.add_argument(
+        "--public-only",
+        action="store_true",
+        help="Process only stored public usernames; private channels remain untouched.",
+    )
     parser.add_argument(
         "--session",
         default="work/iharvester-mtproto-bot",
