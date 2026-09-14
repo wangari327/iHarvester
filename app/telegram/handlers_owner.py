@@ -130,6 +130,17 @@ def _period_label(minutes: int) -> str:
     return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
+def _cleanup_guidance(category: str | None) -> str:
+    """Human action for a cleanup failure; unknown categories stay honest."""
+    guidance = {
+        "ACCESS_OR_PERMISSION": "Restore the bot's channel admin/delete access, then use Retry cleanup.",
+        "DELETE_NOT_ALLOWED": "Telegram refused that deletion. The tracked post remains; open the channel and remove it manually if Telegram still permits it.",
+        "RETRY_EXHAUSTED": "A temporary error exhausted its first retry round. The bot will retry later; Retry cleanup runs it now.",
+        "ALREADY_ABSENT": "The post was already removed manually; the bot will reconcile it as cleaned.",
+    }
+    return guidance.get(category or "", "Open the item after Refresh dashboard to see Telegram's stored error, then retry cleanup once the cause is resolved.")
+
+
 def parse_period_minutes(raw: str, *, field: str) -> int:
     """Parse short owner-entered periods; a month is deliberately 30 days."""
     match = re.fullmatch(r"\s*(\d+)\s*([A-Za-z]+)\s*", raw)
@@ -700,6 +711,16 @@ class OwnerHandlers:
         cycle_stats = await self.repositories.campaign_cycle_stats(campaign["campaign_id"])
         metrics = await self.repositories.campaign_delivery_metrics(campaign["campaign_id"])
         live_count = await self.repositories.campaign_live_state_count(campaign["campaign_id"])
+        cleanup_statuses = (
+            await self.repositories.cleanup_status_summary(campaign["campaign_id"])
+            if status == CampaignStatus.ENDING.value
+            else {}
+        )
+        cleanup_failures_by_category = (
+            await self.repositories.cleanup_failure_summary(campaign["campaign_id"])
+            if status == CampaignStatus.ENDING.value
+            else {}
+        )
         join_count = await self.repositories.campaign_join_count(campaign["campaign_id"])
         latest_cycle = await self.repositories.latest_cycle_report(campaign["campaign_id"])
         delivery_statuses = (
@@ -782,6 +803,24 @@ class OwnerHandlers:
             if campaign.get("rotation_adjustment_notes")
             else ""
         )
+        cleanup_text = ""
+        if status == CampaignStatus.ENDING.value:
+            cleanup_waiting = sum(cleanup_statuses.get(item, 0) for item in ("PENDING", "PROCESSING", "RETRY_WAIT"))
+            blocked = cleanup_statuses.get("CLEANUP_FAILED", 0)
+            cleanup_text = (
+                f"Cleanup: {live_count} tracked posts live  |  {cleanup_waiting} queued/retrying  |  {blocked} blocked\n"
+            )
+            if cleanup_failures_by_category:
+                labels = {
+                    "ACCESS_OR_PERMISSION": "access",
+                    "DELETE_NOT_ALLOWED": "Telegram restriction",
+                    "RETRY_EXHAUSTED": "temporary retry exhausted",
+                }
+                reasons = ", ".join(
+                    f"{labels.get(category, str(category).replace('_', ' ').lower())}: {count}"
+                    for category, count in sorted(cleanup_failures_by_category.items())
+                )
+                cleanup_text += f"Blocked by: {reasons}. Open View cleanup issues for the affected channels.\n"
         latest_text = "Latest cycle: not created yet"
         if latest_cycle:
             latest = latest_cycle.get("delivery_counts", {})
@@ -815,6 +854,7 @@ class OwnerHandlers:
             f"Sent: {sent}  |  Pending: {pending}  |  Failed: {permanent_failed}  |  Unknown: {unknown}\n"
             f"Deleted posts: {metrics.get('replaced_messages', 0) + metrics.get('cleaned_messages', 0)}"
             f"  |  Cleanup failed: {cleanup_failed}  |  Cancelled: {cancelled}\n"
+            f"{cleanup_text}"
             f"Cycles: {cycle_stats.get('completed', 0)}/{expected_cycles} complete "
             f"({cycle_stats.get('planned', 0)} created)  |  Attempts: {metrics.get('attempts', 0)}\n"
             f"Posts currently live: {live_count}  |  Tracked joins: {join_count}\n"
@@ -1566,11 +1606,17 @@ class OwnerHandlers:
             for item in failures:
                 channel = await self.repositories.get_channel(item["channel_id"])
                 title = channel.get("title") if channel else str(item["channel_id"])
+                next_step = (
+                    _cleanup_guidance(item.get("error_category"))
+                    if item["status"] == "CLEANUP_FAILED"
+                    else "Review the error, then use the matching campaign control."
+                )
                 lines.append(
                     f"- {title} ({item['channel_id']})\n"
                     f"  {item['status'].replace('_', ' ').title()} • {item.get('error_category', 'no category')}\n"
                     f"  Attempts: {item.get('attempts', 0)} • Last: {self._date(item.get('updated_at'), campaign.get('owner_timezone', 'UTC'))}\n"
-                    f"  {item.get('error_summary', 'No additional Telegram error summary was stored.')}"
+                    f"  {item.get('error_summary', 'No additional Telegram error summary was stored.')}\n"
+                    f"  Next step: {next_step}"
                 )
             await query.message.answer(
                 "\n".join(lines),

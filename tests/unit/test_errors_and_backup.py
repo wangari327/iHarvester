@@ -20,6 +20,23 @@ def test_429_honors_retry_after() -> None:
     assert decision.retry_after_seconds == 12
 
 
+def test_manually_deleted_campaign_post_is_a_successful_cleanup_outcome() -> None:
+    decision = classify_telegram_error(
+        RuntimeError("Telegram server says - Bad Request: message to delete not found"),
+        operation="delete",
+    )
+    assert decision.kind == ErrorKind.CLEAN_ABSENT
+
+
+def test_telegram_deletion_policy_is_reported_as_a_real_cleanup_blocker() -> None:
+    decision = classify_telegram_error(
+        RuntimeError("Telegram server says - Bad Request: message can't be deleted"),
+        operation="delete",
+    )
+    assert decision.kind == ErrorKind.PERMANENT
+    assert decision.category == "DELETE_NOT_ALLOWED"
+
+
 class FakeRepositories:
     async def export_collections(self, full: bool):
         return {"channels": [{"telegram_chat_id": -1001, "registered_at": datetime(2026, 1, 1, tzinfo=UTC)}], "campaigns": [], "settings": []}

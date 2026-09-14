@@ -83,10 +83,14 @@ class Scheduler:
         # it persists the returned message IDs so cleanup cannot miss them.
         if not await self.repositories.campaign_send_work_is_quiescent(campaign["campaign_id"]):
             return
-        if campaign.get("delete_on_end", True):
+        delete_on_end = campaign.get("delete_on_end", True)
+        if delete_on_end:
             await self.repositories.materialize_cleanup_deliveries(campaign["campaign_id"])
         # When retention was chosen, the live state is deliberately retained:
         # it is the exact campaign-scoped record required if the owner later
         # uses "Delete retained posts". It is not shared with other campaigns.
-        if await self.repositories.cleanup_is_complete(campaign["campaign_id"]):
+        # Retained-post campaigns must archive immediately once their send work
+        # is quiescent. Requiring ``cleanup_is_complete`` here made their own
+        # intentional live-state pointers keep them stuck at ENDING forever.
+        if not delete_on_end or await self.repositories.cleanup_is_complete(campaign["campaign_id"]):
             await self.repositories.mark_campaign_archived(campaign["campaign_id"], campaign.get("end_reason", "ended"))

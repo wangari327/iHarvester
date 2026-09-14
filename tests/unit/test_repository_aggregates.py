@@ -176,6 +176,22 @@ async def test_cleanup_materialization_revives_cancelled_jobs_for_live_posts() -
 
 
 @pytest.mark.asyncio
+async def test_transient_cleanup_failures_are_recovered_without_touching_permission_blocks() -> None:
+    deliveries = CleanupDeliveryCollection()
+    repositories = Repositories.__new__(Repositories)
+    repositories.db = SimpleNamespace(deliveries=deliveries)
+
+    assert await repositories.recover_retryable_cleanup_failures("cmp") == 0
+
+    query, update = deliveries.update_many_calls[0]
+    assert query["status"] == "CLEANUP_FAILED"
+    assert query["error_category"] == "RETRY_EXHAUSTED"
+    assert {"cleanup_auto_retry_count": {"$exists": False}} in query["$and"][0]["$or"]
+    assert update["$set"]["status"] == "PENDING"
+    assert update["$inc"]["cleanup_auto_retry_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_cleanup_cannot_report_complete_while_any_post_is_still_live() -> None:
     live_states = CountCollection([1])
     deliveries = CountCollection([0])

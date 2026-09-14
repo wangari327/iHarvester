@@ -249,6 +249,7 @@ class EndingRepositories:
         self.quiescent = quiescent
         self.materialized = 0
         self.archived = 0
+        self.cleanup_checked = 0
 
     async def cancel_pending_campaign_deliveries(self, campaign_id):
         return None
@@ -263,6 +264,7 @@ class EndingRepositories:
         self.materialized += 1
 
     async def cleanup_is_complete(self, campaign_id):
+        self.cleanup_checked += 1
         return True
 
     async def mark_campaign_archived(self, campaign_id, reason):
@@ -288,6 +290,27 @@ async def test_ending_waits_for_inflight_send_before_cleanup_and_archive() -> No
     repositories.quiescent = True
     await scheduler._finish_ending_campaign(campaign)
     assert (repositories.materialized, repositories.archived) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_retained_campaign_archives_without_waiting_for_its_intentional_live_posts() -> None:
+    repositories = EndingRepositories(quiescent=True)
+    scheduler = Scheduler(
+        instance_id="instance",
+        repositories=repositories,
+        lease_manager=None,
+        campaign_service=None,
+        lease_seconds=30,
+        tick_seconds=1,
+    )
+
+    await scheduler._finish_ending_campaign(
+        {"campaign_id": "cmp", "status": "ENDING", "delete_on_end": False, "end_reason": "window_elapsed"}
+    )
+
+    assert repositories.materialized == 0
+    assert repositories.cleanup_checked == 0
+    assert repositories.archived == 1
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from datetime import timedelta
 from typing import Any
 
 from pymongo.errors import PyMongoError
@@ -177,6 +178,16 @@ class DeliveryWorker:
                     error_category=decision.category,
                     error_summary=self._safe_error_summary(error),
                 )
+                if decision.category == "ACCESS_OR_PERMISSION":
+                    # Future posts are likely to fail too.  Keep this channel
+                    # discoverable in the existing one-click attention refresh
+                    # flow, rather than silently leaving cleanup blocked.
+                    await self.repositories.set_channel_status(
+                        delivery["channel_id"],
+                        ChannelStatus.NEEDS_ATTENTION,
+                        last_error_code="CLEANUP_ACCESS_OR_PERMISSION",
+                        last_error_at=utcnow(),
+                    )
                 return
             else:
                 await self._retry_or_fail(delivery, decision, cleanup=True, error=error)
@@ -186,13 +197,30 @@ class DeliveryWorker:
 
     async def _retry_or_fail(self, delivery: dict[str, Any], decision: Any, cleanup: bool = False, error: Exception | None = None) -> None:
         summary = self._safe_error_summary(error) if error else decision.category
-        if delivery["attempts"] >= self.max_transient_attempts:
+        # Cleanup is idempotent, unlike sends.  Give it a larger bounded retry
+        # budget so a brief Telegram/Atlas disruption cannot leave an otherwise
+        # healthy campaign at ENDING after only a few seconds.
+        max_attempts = max(self.max_transient_attempts, 6) if cleanup else self.max_transient_attempts
+        if delivery["attempts"] >= max_attempts:
             status = DeliveryStatus.CLEANUP_FAILED if cleanup else DeliveryStatus.FAILED_PERMANENT
-            await self._complete(delivery, delivery["_id"], status, error_category="RETRY_EXHAUSTED", error_summary=summary)
+            details: dict[str, Any] = {
+                "error_category": "RETRY_EXHAUSTED",
+                "error_summary": summary,
+            }
+            if cleanup:
+                # The scheduler can make a bounded, delayed recovery attempt
+                # without turning a persistent error into a hot loop.
+                details["cleanup_auto_retry_at"] = utcnow() + timedelta(minutes=5)
+            await self._complete(delivery, delivery["_id"], status, **details)
             return
+        # Spread transient cleanup retries out.  This matters when hundreds of
+        # channels hit a rate limit or a short Telegram outage together.
+        delay = decision.retry_after_seconds or 5
+        if cleanup:
+            delay = min(300, max(delay, 5) * (2 ** min(max(0, int(delivery["attempts"]) - 1), 5)))
         await self.repositories.retry_delivery(
             delivery["_id"],
-            decision.retry_after_seconds or 5,
+            delay,
             error_category=decision.category,
             error_summary=summary,
         )

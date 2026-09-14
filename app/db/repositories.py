@@ -622,7 +622,59 @@ class Repositories:
         ]
         for offset in range(0, len(repair_operations), 500):
             await self.db.deliveries.bulk_write(repair_operations[offset : offset + 500], ordered=False)
-        return len(insert_operations) + len(repair_operations)
+        # A network/rate-limit failure is safe to retry for cleanup, but should
+        # not require the owner to discover and tap a button for every outage.
+        # Permanent access and deletion-policy failures deliberately remain
+        # blocked and visible; retrying them in a hot loop cannot remove posts.
+        recovered_retries = await self.recover_retryable_cleanup_failures(campaign_id)
+        return len(insert_operations) + len(repair_operations) + recovered_retries
+
+    async def recover_retryable_cleanup_failures(self, campaign_id: str) -> int:
+        """Make a bounded delayed retry for exhausted *transient* cleanup work.
+
+        Old versions stopped after a small retry budget and left every such
+        job in ``CLEANUP_FAILED`` until a person happened to find the campaign
+        screen.  This recovery never touches known permission or Telegram
+        deletion-policy failures, and limits each job to four recovery rounds.
+        """
+        now = utcnow()
+        result = await self.db.deliveries.update_many(
+            {
+                "campaign_id": campaign_id,
+                "operation": "CLEANUP",
+                "status": DeliveryStatus.CLEANUP_FAILED.value,
+                "error_category": "RETRY_EXHAUSTED",
+                "$and": [
+                    {
+                        "$or": [
+                            {"cleanup_auto_retry_count": {"$exists": False}},
+                            {"cleanup_auto_retry_count": {"$lt": 4}},
+                        ]
+                    },
+                    {
+                        "$or": [
+                            {"cleanup_auto_retry_at": {"$exists": False}},
+                            {"cleanup_auto_retry_at": {"$lte": now}},
+                        ]
+                    },
+                ],
+            },
+            {
+                "$set": {
+                    "status": DeliveryStatus.PENDING.value,
+                    "attempts": 0,
+                    "worker_id": None,
+                    "lease_until": None,
+                    "next_retry_at": None,
+                    "error_category": None,
+                    "error_summary": None,
+                    "cleanup_auto_recovered_at": now,
+                    "updated_at": now,
+                },
+                "$inc": {"cleanup_auto_retry_count": 1},
+            },
+        )
+        return result.modified_count
 
     async def recover_interrupted_cleanup_campaigns(self) -> int:
         """Reopen campaigns archived by the cancelled-cleanup regression.
@@ -757,6 +809,8 @@ class Repositories:
                     "next_retry_at": None,
                     "error_category": None,
                     "error_summary": None,
+                    "cleanup_auto_retry_count": 0,
+                    "cleanup_auto_retry_at": None,
                     "updated_at": now,
                     "owner_retry_requested_at": now,
                 }
@@ -779,6 +833,32 @@ class Repositories:
             [
                 {"$match": {"campaign_id": campaign_id}},
                 {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ]
+        )
+        rows = await cursor.to_list(None)
+        return {item["_id"]: item["count"] for item in rows}
+
+    async def cleanup_status_summary(self, campaign_id: str) -> Document:
+        cursor = await self.db.deliveries.aggregate(
+            [
+                {"$match": {"campaign_id": campaign_id, "operation": "CLEANUP"}},
+                {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ]
+        )
+        rows = await cursor.to_list(None)
+        return {item["_id"]: item["count"] for item in rows}
+
+    async def cleanup_failure_summary(self, campaign_id: str) -> Document:
+        cursor = await self.db.deliveries.aggregate(
+            [
+                {
+                    "$match": {
+                        "campaign_id": campaign_id,
+                        "operation": "CLEANUP",
+                        "status": DeliveryStatus.CLEANUP_FAILED.value,
+                    }
+                },
+                {"$group": {"_id": {"$ifNull": ["$error_category", "UNKNOWN"]}, "count": {"$sum": 1}}},
             ]
         )
         rows = await cursor.to_list(None)
