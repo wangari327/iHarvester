@@ -1605,7 +1605,7 @@ class OwnerHandlers:
                     reply_markup=campaign_keyboard(campaign_id, campaign["status"], variant_count=len(campaign.get("variants", []))),
                 )
                 return
-            lines = [f"Campaign failures ({len(failures)} shown)", ""]
+            lines = [f"Campaign failures ({len(failures)} shown)", f"Recovery campaign ID: {campaign_id}", ""]
             for item in failures:
                 channel = await self.repositories.get_channel(item["channel_id"])
                 title = channel.get("title") if channel else str(item["channel_id"])

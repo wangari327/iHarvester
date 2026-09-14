@@ -1,0 +1,5 @@
+# Optional workstation-only recovery tool. This is intentionally not part of
+# the Koyeb service image: it uses the existing bot identity over MTProto for
+# a one-off, owner-initiated cleanup of posts that the Bot API can no longer
+# remove.
+telethon>=1.45,<2

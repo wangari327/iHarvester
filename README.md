@@ -4,6 +4,8 @@ iHarvester is a Telegram-native campaign orchestrator for an owner-operated netw
 
 It deliberately remains one Python service plus MongoDB: no Redis, Celery, dashboard, redirect tracker, user-account login, or separate worker deployment.
 
+If a past campaign's cleanup is blocked by Telegram's Bot API 48-hour limit, use the workstation-only [MTProto recovery guide](docs/mtproto-recovery.md). It authenticates the existing bot identity—not a channel owner's personal account—and deletes only iHarvester's exact tracked message IDs after a small pilot succeeds.
+
 ## The quickest production path: Koyeb
 
 1. Create a MongoDB Atlas database and copy its connection URI.
