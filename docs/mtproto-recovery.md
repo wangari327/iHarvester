@@ -44,6 +44,8 @@ Use the campaign ID shown on the first line of **View cleanup issues** as `Recov
 
 The tool uses a conservative four requests per second and obeys Telegram flood waits. Successful deletes are reconciled directly in Mongo as `CLEANED`; failed rows remain intact with an `mtproto_last_error`. When it completes, open the campaign and tap **Refresh dashboard**. Normal iHarvester cleanup will archive it once no tracked posts remain.
 
+For a human-admin session, the tool first loads dialogs only to seed Telegram access hashes, then resolves every exact campaign target separately. This prevents a healthy channel hidden from an account's normal dialog list from being skipped. It never reads channel history or matches content; a stored public username is accepted only when it resolves to the exact saved channel ID.
+
 If the ten-channel pilot reports `CHAT_ADMIN_REQUIRED` or `CHANNEL_PRIVATE`, those are real access exceptions for that channel. Do not run the full recovery until the sample shows that the common bot identity can delete the old posts.
 
 ## Channels owned across multiple human accounts

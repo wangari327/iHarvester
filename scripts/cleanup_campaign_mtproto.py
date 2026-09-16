@@ -111,20 +111,40 @@ def _limited(targets: list[CleanupTarget], limit: int | None) -> list[CleanupTar
     return targets if limit is None else targets[:limit]
 
 
-async def _account_channel_ids(client: TelegramClient) -> set[int]:
-    """Return Bot API-shaped IDs for channels in a human account's dialogs."""
+async def _resolve_channel(
+    client: TelegramClient,
+    target: CleanupTarget,
+    *,
+    allow_public_username: bool,
+) -> Any:
+    """Resolve one exact campaign target to an ``InputChannel`` safely.
 
-    dialogs = await client.get_dialogs(limit=None)
-    channel_ids: set[int] = set()
-    for dialog in dialogs:
-        try:
-            entity = await client.get_input_entity(dialog.entity)
-        except ValueError:
-            continue
-        mtproto_channel_id = getattr(entity, "channel_id", None)
-        if isinstance(mtproto_channel_id, int):
-            channel_ids.add(-1_000_000_000_000 - mtproto_channel_id)
-    return channel_ids
+    ``get_dialogs`` seeds Telethon's entity cache, but a channel can still be
+    missing from the ordinary dialog list (for example, when Telegram hides it
+    behind a folder).  Do not treat that list as an access-control boundary.
+    A stored public username provides a safe, no-history fallback.  In every
+    case the resolved MTProto channel ID must match the Bot API channel ID in
+    campaign state before a delete can be attempted.
+    """
+
+    expected_channel_id = -target.channel_id - 1_000_000_000_000
+    try:
+        entity = await client.get_input_entity(target.channel_id)
+    except ValueError:
+        if not allow_public_username or not target.username:
+            raise ChannelUnavailableError(
+                "This session has no cached MTProto access hash for the channel."
+            ) from None
+        entity = await client.get_input_entity(target.username)
+
+    if getattr(entity, "channel_id", None) != expected_channel_id:
+        raise RuntimeError(
+            "Telegram resolved a different channel than the exact campaign target; refusing to delete."
+        )
+    access_hash = getattr(entity, "access_hash", None)
+    if not isinstance(access_hash, int):
+        raise ChannelUnavailableError("Telegram did not provide an access hash for this channel.")
+    return types.InputChannel(expected_channel_id, access_hash)
 
 
 def _mark_cleaned(database: Any, campaign_id: str, target: CleanupTarget) -> None:
@@ -174,27 +194,19 @@ async def _delete_target(
     target: CleanupTarget,
     *,
     allow_public_username: bool,
+    channel: Any | None = None,
 ) -> None:
     # ``delete_messages`` resolves to Telegram's channels.deleteMessages for
     # channels. It receives exact IDs from campaign state—there is no forward
     # or backward channel-history iteration and no risk of matching new posts.
-    try:
-        entity = await client.get_input_entity(target.channel_id)
-    except ValueError:
-        if not allow_public_username or not target.username:
-            raise ChannelUnavailableError(
-                "This session has no cached MTProto access hash for the channel."
-            ) from None
-        entity = await client.get_input_entity(target.username)
-        expected_channel_id = -target.channel_id - 1_000_000_000_000
-        if getattr(entity, "channel_id", None) != expected_channel_id:
-            raise RuntimeError(
-                f"@{target.username} resolved to a different channel; refusing to delete the tracked post."
-            ) from None
     # Telethon's convenience helper chooses a generic deletion method for
-    # some cached peer shapes.  This recovery is exclusively for channels, so
+    # some cached peer shapes. This recovery is exclusively for channels, so
     # explicitly call the channel endpoint that accepts an InputChannel.
-    channel = types.InputChannel(entity.channel_id, entity.access_hash)
+    channel = channel or await _resolve_channel(
+        client,
+        target,
+        allow_public_username=allow_public_username,
+    )
     await client(functions.channels.DeleteMessagesRequest(channel, list(target.message_ids)))
 
 
@@ -212,9 +224,10 @@ async def run(args: argparse.Namespace) -> int:
             raise SystemExit("Campaign not found. Copy its campaign ID from the bot's report/export.")
         if campaign.get("status") not in {"ENDING", "ARCHIVED"}:
             raise SystemExit("MTProto recovery only accepts an ENDING or ARCHIVED campaign; stop it first.")
-        # A human account has to be matched to its own directory before the
-        # pilot limit is applied. A bot can only resolve public usernames, so
-        # it keeps the prior direct target selection.
+        # A human session loads dialogs to seed Telethon's entity cache, then
+        # resolves exact campaign targets individually. A dialog list is not a
+        # complete access boundary: Telegram can omit a healthy channel from a
+        # user's main list. A bot can only use stored public usernames.
         targets = _targets(
             database,
             args.campaign,
@@ -245,18 +258,34 @@ async def run(args: argparse.Namespace) -> int:
             raise SystemExit("The configured BOT_TOKEN did not authenticate as a bot. Refusing to use a personal account.")
         if args.identity == "user" and identity.bot:
             raise SystemExit("The selected session is a bot. Use --identity bot or authorize a human admin account.")
+        resolved_channels: dict[int, Any] = {}
+        unavailable_before_start = 0
         if args.identity == "user":
-            logger.info("Loading this human admin's channel directory (no message history is scanned).")
-            account_channel_ids = await _account_channel_ids(client)
+            logger.info("Loading this human admin's directory to seed access hashes (no message history is scanned).")
+            dialogs = await client.get_dialogs(limit=None)
             campaign_targets = len(targets)
+            logger.info("Loaded %s dialogs; resolving %s exact tracked campaign targets.", len(dialogs), campaign_targets)
+            for target in targets:
+                try:
+                    resolved_channels[target.channel_id] = await _resolve_channel(
+                        client,
+                        target,
+                        allow_public_username=True,
+                    )
+                except ChannelUnavailableError:
+                    unavailable_before_start += 1
+                except Exception as error:
+                    logger.warning("Could not resolve channel %s safely: %s", target.channel_id, error)
+                    unavailable_before_start += 1
             targets = _limited(
-                [target for target in targets if target.channel_id in account_channel_ids],
+                [target for target in targets if target.channel_id in resolved_channels],
                 args.limit,
             )
             logger.info(
-                "This account matches %s of %s tracked campaign channels.",
-                len(targets),
+                "This account resolved %s of %s tracked campaign channels; %s remain unavailable to this session.",
+                len(resolved_channels),
                 campaign_targets,
+                unavailable_before_start,
             )
         message_total = sum(len(target.message_ids) for target in targets)
         logger.info(
@@ -288,7 +317,7 @@ async def run(args: argparse.Namespace) -> int:
 
         deleted = 0
         failed = 0
-        skipped = 0
+        skipped = unavailable_before_start
         delay = 1 / args.rps
         try:
             for index, target in enumerate(targets, start=1):
@@ -298,6 +327,7 @@ async def run(args: argparse.Namespace) -> int:
                         client,
                         target,
                         allow_public_username=args.identity == "bot",
+                        channel=resolved_channels.get(target.channel_id),
                     )
                 except ChannelUnavailableError:
                     skipped += 1
@@ -316,6 +346,7 @@ async def run(args: argparse.Namespace) -> int:
                             client,
                             target,
                             allow_public_username=args.identity == "bot",
+                            channel=resolved_channels.get(target.channel_id),
                         )
                     except Exception as retry_error:
                         failure = retry_error
