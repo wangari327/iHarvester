@@ -65,6 +65,7 @@ def button_layout_manifest(creative_data: dict[str, Any]) -> str:
         lines.append(f"\nRow {row_number}")
         for button_number, button in enumerate(row, start=1):
             lines.append(f"{button_number}. {button.text}")
+            lines.append(f"Style: {button.style}")
             lines.append(str(button.url))
     return "\n".join(lines)
 

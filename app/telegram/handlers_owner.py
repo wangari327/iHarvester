@@ -86,6 +86,32 @@ _SAFE_REPOST_MAX_MINUTES = 47 * 60
 _MAX_VARIANTS = 20
 _MAX_DESTINATIONS = 20
 _MAX_CTA_BUTTONS = 20
+_CTA_STYLES = {
+    "default": "Neutral",
+    "primary": "Blue",
+    "success": "Green",
+    "danger": "Red",
+}
+
+
+def _cta_style_label(style: str) -> str:
+    return _CTA_STYLES.get(style, "Neutral")
+
+
+def cta_style_keyboard(back_callback: str) -> InlineKeyboardMarkup:
+    """Choose a native Bot API button style without asking the owner to type."""
+
+    return _markup(
+        [
+            [InlineKeyboardButton(text="Neutral", callback_data="tone:default")],
+            [InlineKeyboardButton(text="Blue • main action", callback_data="tone:primary", style="primary")],
+            [
+                InlineKeyboardButton(text="Green • positive", callback_data="tone:success", style="success"),
+                InlineKeyboardButton(text="Red • warning", callback_data="tone:danger", style="danger"),
+            ],
+            *_navigation(back_callback),
+        ]
+    )
 
 
 async def refresh_attention_channels(bot: Bot, repositories: Repositories, *, concurrency: int = 6) -> dict[str, int]:
@@ -1027,7 +1053,7 @@ class OwnerHandlers:
         if creative.buttons:
             by_row: dict[int, list[str]] = {}
             for button in sorted(creative.buttons, key=lambda item: (item.row, item.position)):
-                by_row.setdefault(button.row, []).append(button.text)
+                by_row.setdefault(button.row, []).append(f"{button.text} [{_cta_style_label(button.style)}]")
             canvas = "\n".join(f"Row {row + 1}: {' | '.join(labels)}" for row, labels in by_row.items())
         else:
             canvas = "No CTA buttons yet."
@@ -1055,13 +1081,22 @@ class OwnerHandlers:
             ]
         )
         for button in creative.buttons:
-            rows.append([InlineKeyboardButton(text=f"Remove: {button.text}", callback_data=f"rm:{cid}:{variant_index}:{button.id}")])
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"Color: {button.text} ({_cta_style_label(button.style)})",
+                        callback_data=f"toneedit:{cid}:{variant_index}:{button.id}",
+                    ),
+                    InlineKeyboardButton(text="Remove", callback_data=f"rm:{cid}:{variant_index}:{button.id}"),
+                ]
+            )
         rows.append([InlineKeyboardButton(text="Send real preview", callback_data=f"preview:{cid}:{variant_index}")])
         rows.append([InlineKeyboardButton(text="Back to campaign", callback_data=f"c:{cid}:open")])
         await self._render(
             message,
             f"CTA button editor - variant {variant_index + 1}\n\n{canvas}\n\n"
-            "Use beside-last for a horizontal button and new-row for a vertical button. Names are saved unchanged.",
+            "Use beside-last for a horizontal button and new-row for a vertical button. "
+            "Tap Color to choose Telegram's native blue, green, red, or neutral style.",
             _markup(rows),
         )
 
@@ -1181,6 +1216,12 @@ class OwnerHandlers:
                     "Send the CTA button label exactly as you want viewers to see it.",
                     reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
                 )
+            elif data.startswith("toneedit:"):
+                _, campaign_id, index, button_id = data.split(":", 3)
+                await self._begin_button_style_edit(query, campaign_id, int(index), button_id)
+            elif data.startswith("tone:"):
+                _, style = data.split(":", 1)
+                await self._apply_button_style(query, style)
             elif data.startswith("album:"):
                 _, campaign_id, action = data.split(":", 2)
                 if action != "finish":
@@ -1703,6 +1744,67 @@ class OwnerHandlers:
             },
         )
         campaign["variants"] = [item.model_dump(mode="json") for item in variants]
+        await self._show_button_editor(query.message, campaign, index)
+
+    async def _begin_button_style_edit(self, query: CallbackQuery, campaign_id: str, index: int, button_id: str) -> None:
+        campaign = await self.campaigns.editable_campaign(campaign_id)
+        variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
+        if index < 0 or index >= len(variants):
+            raise ValueError("CTA variant no longer exists")
+        button = next((item for item in variants[index].buttons if item.id == button_id), None)
+        if not button:
+            raise ValueError("CTA button no longer exists")
+        await self.repositories.set_owner_session(
+            query.from_user.id,
+            {
+                "action": "choose_existing_button_style",
+                "campaign_id": campaign_id,
+                "variant_index": index,
+                "button_id": button_id,
+            },
+        )
+        await query.message.answer(
+            f"Choose the native Telegram color for “{button.text}”.",
+            reply_markup=cta_style_keyboard(f"edit:{campaign_id}:{index}"),
+        )
+
+    async def _apply_button_style(self, query: CallbackQuery, style: str) -> None:
+        if style not in _CTA_STYLES:
+            raise ValueError("invalid CTA color")
+        session = await self.repositories.owner_session(query.from_user.id)
+        if not session:
+            raise ValueError("that color chooser expired; reopen the CTA editor")
+        action = session.get("action")
+        campaign_id = str(session.get("campaign_id") or "")
+        if not campaign_id:
+            raise ValueError("that color chooser is missing its campaign")
+        if action == "choose_new_button_style":
+            await self._save_button(query.message, {**session, "style": style})
+            return
+        if action != "choose_existing_button_style":
+            raise ValueError("that color chooser is no longer active")
+        index = int(session["variant_index"])
+        campaign = await self.campaigns.editable_campaign(campaign_id)
+        variants = [Creative.model_validate(item) for item in campaign.get("variants", [])]
+        if index < 0 or index >= len(variants):
+            raise ValueError("CTA variant no longer exists")
+        button = next((item for item in variants[index].buttons if item.id == session.get("button_id")), None)
+        if not button:
+            raise ValueError("CTA button no longer exists")
+        button.style = style
+        stored = [item.model_dump(mode="json") for item in variants]
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "variants": stored,
+                "preview_sent": False,
+                "previewed_variant_ids": [],
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        await self.repositories.clear_owner_session(query.from_user.id)
+        campaign["variants"] = stored
+        await query.message.answer(f"CTA color saved: {_cta_style_label(style)}.")
         await self._show_button_editor(query.message, campaign, index)
 
     async def _remove_button(self, query: CallbackQuery, campaign_id: str, index: int, button_id: str) -> None:
@@ -2701,7 +2803,16 @@ class OwnerHandlers:
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "await_button_url":
-            await self._save_button(message, session)
+            url = (message.text or "").strip()
+            Button(id="validate", text=str(session.get("label") or ""), url=url)
+            await self.repositories.set_owner_session(
+                owner_id,
+                {**session, "action": "choose_new_button_style", "url": url},
+            )
+            await message.answer(
+                "Choose this CTA button's native Telegram color. Neutral is safest; blue is best for the main action.",
+                reply_markup=cta_style_keyboard(f"edit:{campaign_id}:{session['variant_index']}"),
+            )
         elif action == "await_destination_name":
             name = (message.text or "").strip()
             if not name:
@@ -3109,7 +3220,16 @@ class OwnerHandlers:
             creative.button_layout = "CUSTOM"
         else:
             row = position = 0
-        creative.buttons.append(Button(id=opaque_id("btn"), text=session["label"], url=(message.text or "").strip(), row=row, position=position))
+        creative.buttons.append(
+            Button(
+                id=opaque_id("btn"),
+                text=session["label"],
+                url=str(session.get("url") or message.text or "").strip(),
+                style=str(session.get("style") or "default"),
+                row=row,
+                position=position,
+            )
+        )
         stored = [item.model_dump(mode="json") for item in variants]
         await self.repositories.update_campaign(
             session["campaign_id"],
@@ -3122,7 +3242,7 @@ class OwnerHandlers:
         )
         await self.repositories.clear_owner_session(message.from_user.id)
         campaign["variants"] = stored
-        await message.answer("CTA button saved. Use the placement controls to add the next one beside it or on a new row.")
+        await message.answer("CTA button saved with its native Telegram color. Use the placement controls to add the next one beside it or on a new row.")
         await self._show_button_editor(message, campaign, index)
 
     async def _save_destination(self, campaign_id: str, name: str, url: str, chat_id: int | None) -> None:

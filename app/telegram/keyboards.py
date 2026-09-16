@@ -29,7 +29,14 @@ def audience_markup(buttons: list[Button], layout: str = "AUTO") -> InlineKeyboa
     if not buttons:
         return None
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=button.text, url=str(button.url)) for button in row
+        InlineKeyboardButton(
+            text=button.text,
+            url=str(button.url),
+            # Telegram's native CTA colors are optional. Older saved campaigns
+            # use ``default`` and remain neutral without a migration.
+            style=None if button.style == "default" else button.style,
+        )
+        for button in row
     ] for row in auto_button_rows(buttons, layout)])
 
 
@@ -41,4 +48,3 @@ def home_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="Backups", callback_data="home:backups")],
         [InlineKeyboardButton(text="Settings", callback_data="home:settings")],
     ])
-

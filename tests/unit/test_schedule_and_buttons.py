@@ -8,6 +8,7 @@ from app.telegram.handlers_owner import (
     OwnerHandlers,
     campaign_keyboard,
     content_type_keyboard,
+    cta_style_keyboard,
     parse_period_minutes,
     parse_repost_gaps_minutes,
     parse_repost_offsets_minutes,
@@ -15,7 +16,7 @@ from app.telegram.handlers_owner import (
     quick_interval_keyboard,
     retention_keyboard,
 )
-from app.telegram.keyboards import auto_button_rows
+from app.telegram.keyboards import audience_markup, auto_button_rows
 
 
 def button(label: str, row: int = 0) -> Button:
@@ -41,6 +42,26 @@ def test_horizontal_first_buttons_wrap_without_truncation() -> None:
 def test_custom_rows_are_respected() -> None:
     rows = auto_button_rows([button("A", 1), button("B", 0), button("C", 1)], "CUSTOM")
     assert [[item.text for item in row] for row in rows] == [["B"], ["A", "C"]]
+
+
+def test_campaign_cta_colors_are_rendered_with_native_bot_api_styles() -> None:
+    markup = audience_markup(
+        [
+            Button(id="neutral", text="Neutral", url="https://t.me/example", style="default"),
+            Button(id="blue", text="Blue", url="https://t.me/example", style="primary"),
+            Button(id="green", text="Green", url="https://t.me/example", style="success"),
+            Button(id="red", text="Red", url="https://t.me/example", style="danger"),
+        ],
+        "1",
+    )
+    assert markup is not None
+    assert [row[0].style for row in markup.inline_keyboard] == [None, "primary", "success", "danger"]
+
+
+def test_cta_color_picker_exposes_neutral_blue_green_and_red_choices() -> None:
+    buttons = [button for row in cta_style_keyboard("c:cmp:open").inline_keyboard for button in row]
+    assert {"Neutral", "Blue • main action", "Green • positive", "Red • warning"} <= {button.text for button in buttons}
+    assert {button.style for button in buttons} >= {None, "primary", "success", "danger"}
 
 
 def test_guided_creator_uses_callback_controls_not_pipe_delimited_commands() -> None:

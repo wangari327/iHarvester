@@ -112,8 +112,16 @@ def test_inline_mode_rejects_multi_message_and_video_note_snapshots_cleanly() ->
 
 def test_cta_fallback_preserves_labels_urls_and_rows() -> None:
     manifest = button_layout_manifest(creative_data())
-    assert "Row 1\n1. First\nhttps://example.com/one" in manifest
-    assert "Row 2\n1. Second\nhttps://example.com/two" in manifest
+    assert "Row 1\n1. First\nStyle: default\nhttps://example.com/one" in manifest
+    assert "Row 2\n1. Second\nStyle: default\nhttps://example.com/two" in manifest
+
+
+def test_inline_result_preserves_native_cta_color() -> None:
+    creative = creative_data(
+        buttons=[Button(id="one", text="Open", url="https://example.com", style="success").model_dump(mode="json")],
+    )
+    result = inline_result_for_share(share(creative))
+    assert result.reply_markup.inline_keyboard[0][0].style == "success"
 
 
 def test_owner_router_subscribes_to_inline_updates_for_webhook_registration() -> None:
