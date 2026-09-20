@@ -472,6 +472,125 @@ class Repositories:
     async def live_states(self, campaign_id: str) -> list[Document]:
         return await self.db.campaign_channel_state.find({"campaign_id": campaign_id}).to_list(None)
 
+    async def queue_live_text_repairs(
+        self,
+        *,
+        campaign_id: str,
+        repair_id: str,
+        variant_id: str,
+        variant_index: int,
+        variant_revision: int,
+        creative: Document,
+        states: list[Document],
+    ) -> int:
+        """Durably queue an in-place text repair for the matching live posts.
+
+        A repair records the exact message IDs and creative snapshot that were
+        current when the owner confirmed it.  The worker re-checks that live
+        pointer before editing, so a later repost can never be overwritten by
+        an older repair job.
+        """
+        now = utcnow()
+        operations: list[UpdateOne] = []
+        for state in states:
+            if int(state.get("current_variant_index", -1)) != variant_index:
+                continue
+            message_ids = [int(item) for item in state.get("current_message_ids", [])]
+            if not message_ids:
+                continue
+            channel_id = int(state["channel_id"])
+            document: Document = {
+                "campaign_id": campaign_id,
+                "repair_id": repair_id,
+                "channel_id": channel_id,
+                "variant_id": variant_id,
+                "variant_index": variant_index,
+                "variant_revision": variant_revision,
+                "message_ids": message_ids,
+                "creative": creative,
+                "status": "PENDING",
+                "attempts": 0,
+                "worker_id": None,
+                "lease_until": None,
+                "next_retry_at": None,
+                "dispatch_rank": secrets.randbelow(2_000_000_000),
+                "created_at": now,
+                "updated_at": now,
+            }
+            operations.append(
+                UpdateOne(
+                    {"campaign_id": campaign_id, "repair_id": repair_id, "channel_id": channel_id},
+                    {"$setOnInsert": document},
+                    upsert=True,
+                )
+            )
+        if not operations:
+            return 0
+        for offset in range(0, len(operations), 500):
+            await self.db.live_text_repairs.bulk_write(operations[offset : offset + 500], ordered=False)
+        return len(operations)
+
+    async def claim_live_text_repair(self, worker_id: str, lease_seconds: int) -> Document | None:
+        now = utcnow()
+        return await self.db.live_text_repairs.find_one_and_update(
+            {
+                "$or": [
+                    {"status": "PENDING"},
+                    {"status": "RETRY_WAIT", "next_retry_at": {"$lte": now}},
+                    {"status": "PROCESSING", "lease_until": {"$lte": now}},
+                ]
+            },
+            {
+                "$set": {
+                    "status": "PROCESSING",
+                    "worker_id": worker_id,
+                    "lease_until": now + timedelta(seconds=lease_seconds),
+                    "updated_at": now,
+                },
+                "$inc": {"attempts": 1},
+            },
+            sort=[("dispatch_rank", ASCENDING)],
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def complete_live_text_repair(self, repair_id: Any, status: str, **details: Any) -> None:
+        await self.db.live_text_repairs.update_one(
+            {"_id": repair_id},
+            {
+                "$set": {
+                    "status": status,
+                    "lease_until": None,
+                    "updated_at": utcnow(),
+                    **details,
+                }
+            },
+        )
+
+    async def retry_live_text_repair(self, repair_id: Any, retry_after_seconds: float, **details: Any) -> None:
+        now = utcnow()
+        await self.db.live_text_repairs.update_one(
+            {"_id": repair_id},
+            {
+                "$set": {
+                    "status": "RETRY_WAIT",
+                    "lease_until": None,
+                    "next_retry_at": now + timedelta(seconds=retry_after_seconds),
+                    "updated_at": now,
+                    **details,
+                }
+            },
+        )
+
+    async def live_text_repair_summary(self, campaign_id: str, repair_id: str) -> Document:
+        cursor = await self.db.live_text_repairs.aggregate(
+            [
+                {"$match": {"campaign_id": campaign_id, "repair_id": repair_id}},
+                {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ]
+        )
+        rows = await cursor.to_list(None)
+        return {str(row["_id"]): int(row["count"]) for row in rows}
+
     async def oldest_live_state_updated_at(self, campaign_id: str) -> Any | None:
         """Oldest confirmed campaign post, used to stay inside Telegram's delete window."""
         state = await self.db.campaign_channel_state.find_one(

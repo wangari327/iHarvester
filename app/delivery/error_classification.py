@@ -29,8 +29,9 @@ def classify_telegram_error(error: Exception, *, operation: str) -> ErrorDecisio
     # cleanup turn.  Telegram reports that as a Bad Request, but it is a
     # successful cleanup outcome from the campaign's point of view.  Do not
     # strand the rest of an album (or the whole campaign) on that one ID.
-    if operation == "delete" and any(token in message for token in (
+    if operation in {"delete", "edit"} and any(token in message for token in (
         "message to delete not found",
+        "message to edit not found",
         "message not found",
         "message_id_invalid",
     )):

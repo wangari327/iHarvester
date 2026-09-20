@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.backups.automatic import AutomaticBackupWorker
+from app.campaigns.models import Creative
 from app.campaigns.scheduler import Scheduler
 from app.campaigns.service import CampaignService
 from app.delivery.worker import DeliveryWorker
@@ -131,6 +132,59 @@ async def test_scheduled_campaign_returns_to_draft_without_losing_its_plan() -> 
     assert draft["target_snapshot"] == []
 
 
+class LiveRepairQueueRepositories:
+    def __init__(self):
+        self.campaign = {
+            "campaign_id": "cmp",
+            "variants": [{"id": "v1", "kind": "TEXT", "text": "corrected", "buttons": [], "button_layout": "AUTO"}],
+            "variant_current_revisions": {"v1": 2},
+        }
+        self.queued = None
+        self.updated = None
+
+    async def live_states(self, campaign_id):
+        return [
+            {"channel_id": -1001, "current_variant_index": 0, "current_message_ids": [11]},
+            {"channel_id": -1002, "current_variant_index": 1, "current_message_ids": [12]},
+        ]
+
+    async def queue_live_text_repairs(self, **kwargs):
+        self.queued = kwargs
+        return 1
+
+    async def update_campaign(self, campaign_id, update):
+        self.updated = update
+        self.campaign.update(update)
+        return True
+
+    async def get_campaign(self, campaign_id):
+        return self.campaign
+
+
+@pytest.mark.asyncio
+async def test_live_text_repair_queues_a_durable_variant_snapshot() -> None:
+    repositories = LiveRepairQueueRepositories()
+    service = CampaignService(repositories, 20)
+
+    async def replace(*args, **kwargs):
+        return repositories.campaign, 1, True
+
+    service.replace_running_variant = replace  # type: ignore[method-assign]
+    updated, applies_from, has_future, queued = await service.replace_and_repair_live_text_variant(
+        "cmp",
+        0,
+        Creative(id="v1", kind="TEXT", text="corrected"),
+        owner_id=7,
+    )
+
+    assert updated["campaign_id"] == "cmp"
+    assert (applies_from, has_future, queued) == (1, True, 1)
+    assert repositories.queued["variant_id"] == "v1"
+    assert repositories.queued["variant_revision"] == 2
+    assert repositories.queued["states"][0]["current_message_ids"] == [11]
+    assert repositories.updated["latest_live_text_repair"]["queued"] == 1
+
+
 class NoopLimiter:
     async def acquire(self):
         return None
@@ -242,6 +296,95 @@ async def test_repost_deletes_every_album_item_even_when_one_is_already_absent()
     assert repositories.completed[-1][2]["replaced_message_count"] == 1
     assert repositories.cycle_finished == 1
     assert repositories.superseded_cleanup == 1
+
+
+class LiveRepairRepositories:
+    def __init__(self, state=None):
+        self.campaign = {"campaign_id": "cmp", "status": "ACTIVE"}
+        self.state = state or {"current_variant_index": 0, "current_message_ids": [44]}
+        self.completed = []
+
+    async def get_campaign(self, campaign_id):
+        return self.campaign
+
+    async def live_state(self, campaign_id, channel_id):
+        return self.state
+
+    async def complete_live_text_repair(self, repair_id, status, **details):
+        self.completed.append((repair_id, status, details))
+
+    async def retry_live_text_repair(self, *args, **kwargs):
+        raise AssertionError("a successful repair must not be retried")
+
+    async def set_channel_status(self, *args, **kwargs):
+        return None
+
+
+class LiveRepairSender:
+    def __init__(self):
+        self.edits = []
+
+    async def edit_live_text_variant(self, channel_id, message_id, creative):
+        self.edits.append((channel_id, message_id, creative))
+
+
+@pytest.mark.asyncio
+async def test_live_text_repair_edits_only_the_still_current_message() -> None:
+    repositories = LiveRepairRepositories()
+    sender = LiveRepairSender()
+    worker = DeliveryWorker(
+        worker_id="worker",
+        repositories=repositories,
+        sender=sender,
+        send_limiter=NoopLimiter(),
+        mutation_limiter=NoopLimiter(),
+        delivery_lease_seconds=30,
+        max_transient_attempts=3,
+    )
+    repair = {
+        "_id": "repair",
+        "campaign_id": "cmp",
+        "channel_id": -1001,
+        "variant_index": 0,
+        "message_ids": [44],
+        "creative": {"id": "v1", "kind": "TEXT", "text": "corrected"},
+        "attempts": 1,
+    }
+
+    await worker.process_live_text_repair(repair)
+
+    assert sender.edits == [(-1001, 44, repair["creative"])]
+    assert repositories.completed == [("repair", "SUCCEEDED", {"edited_message_count": 1, "already_current_count": 0})]
+
+
+@pytest.mark.asyncio
+async def test_live_text_repair_skips_a_post_replaced_by_a_newer_cycle() -> None:
+    repositories = LiveRepairRepositories({"current_variant_index": 0, "current_message_ids": [45]})
+    sender = LiveRepairSender()
+    worker = DeliveryWorker(
+        worker_id="worker",
+        repositories=repositories,
+        sender=sender,
+        send_limiter=NoopLimiter(),
+        mutation_limiter=NoopLimiter(),
+        delivery_lease_seconds=30,
+        max_transient_attempts=3,
+    )
+
+    await worker.process_live_text_repair(
+        {
+            "_id": "repair",
+            "campaign_id": "cmp",
+            "channel_id": -1001,
+            "variant_index": 0,
+            "message_ids": [44],
+            "creative": {"id": "v1", "kind": "TEXT", "text": "corrected"},
+        }
+    )
+
+    assert sender.edits == []
+    assert repositories.completed[0][1] == "SKIPPED"
+    assert repositories.completed[0][2]["error_category"] == "SUPERSEDED"
 
 
 class EndingRepositories:

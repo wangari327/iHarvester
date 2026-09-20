@@ -16,6 +16,11 @@ async def ensure_indexes(database: Database) -> None:
     await db.deliveries.create_index([("status", 1), ("next_retry_at", 1), ("lease_until", 1), ("dispatch_rank", 1)])
     await db.campaign_channel_state.create_index([("campaign_id", 1), ("channel_id", 1)], unique=True)
     await db.campaign_channel_state.create_index([("campaign_id", 1), ("updated_at", 1)])
+    # In-place repairs are separate from delivery cycles so campaign send and
+    # cleanup statistics remain exact.  A repair can safely resume after a
+    # deployment because each channel/message snapshot is durable.
+    await db.live_text_repairs.create_index([("campaign_id", 1), ("repair_id", 1), ("channel_id", 1)], unique=True)
+    await db.live_text_repairs.create_index([("status", 1), ("next_retry_at", 1), ("lease_until", 1), ("dispatch_rank", 1)])
     await db.locks.create_index("lock_name", unique=True)
     await db.join_events.create_index([("campaign_id", 1), ("destination_id", 1), ("joined_at_utc", 1)])
     await db.processed_updates.create_index("update_id", unique=True)

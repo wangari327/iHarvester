@@ -755,6 +755,12 @@ class OwnerHandlers:
         cycle_stats = await self.repositories.campaign_cycle_stats(campaign["campaign_id"])
         metrics = await self.repositories.campaign_delivery_metrics(campaign["campaign_id"])
         live_count = await self.repositories.campaign_live_state_count(campaign["campaign_id"])
+        latest_live_repair = campaign.get("latest_live_text_repair") or {}
+        repair_statuses = (
+            await self.repositories.live_text_repair_summary(campaign["campaign_id"], latest_live_repair["repair_id"])
+            if latest_live_repair.get("repair_id")
+            else {}
+        )
         cleanup_statuses = (
             await self.repositories.cleanup_status_summary(campaign["campaign_id"])
             if status == CampaignStatus.ENDING.value
@@ -847,6 +853,19 @@ class OwnerHandlers:
             if campaign.get("rotation_adjustment_notes")
             else ""
         )
+        repair_text = ""
+        if latest_live_repair:
+            repair_total = sum(repair_statuses.values())
+            repair_complete = sum(repair_statuses.get(item, 0) for item in ("SUCCEEDED", "SKIPPED", "FAILED"))
+            if repair_total:
+                repair_text = (
+                    f"Live text repair: {self._bar(repair_complete, repair_total, 8)}  {repair_complete}/{repair_total}\n"
+                    f"Edited: {repair_statuses.get('SUCCEEDED', 0)}  |  Waiting: "
+                    f"{sum(repair_statuses.get(item, 0) for item in ('PENDING', 'PROCESSING', 'RETRY_WAIT'))}"
+                    f"  |  Skipped: {repair_statuses.get('SKIPPED', 0)}  |  Failed: {repair_statuses.get('FAILED', 0)}\n"
+                )
+            else:
+                repair_text = "Live text repair: no current posts matched this variant.\n"
         cleanup_text = ""
         if status == CampaignStatus.ENDING.value:
             cleanup_waiting = sum(cleanup_statuses.get(item, 0) for item in ("PENDING", "PROCESSING", "RETRY_WAIT"))
@@ -892,6 +911,7 @@ class OwnerHandlers:
             f"Repost plan: {repost_plan}\n"
             f"Next cycle: {next_cycle_text}\n\n"
             f"{adjustment_text}"
+            f"{repair_text}"
             f"{coverage_text}"
             f"{report_heading}\n"
             f"Deliveries: {delivery_progress}\n"
@@ -2054,14 +2074,20 @@ class OwnerHandlers:
                     ]
                 )
             elif status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
-                rows.append(
-                    [
+                controls = [
+                    InlineKeyboardButton(
+                        text="Replace next repost",
+                        callback_data=f"var:{campaign_id}:{index}:replace",
+                    )
+                ]
+                if item.get("kind") == "TEXT":
+                    controls.append(
                         InlineKeyboardButton(
-                            text="Replace in future cycles",
-                            callback_data=f"var:{campaign_id}:{index}:replace",
+                            text="Repair live posts now",
+                            callback_data=f"var:{campaign_id}:{index}:repair",
                         )
-                    ]
-                )
+                    )
+                rows.append(controls)
         if status == CampaignStatus.DRAFT.value:
             rows.append([InlineKeyboardButton(text="+ Add variant", callback_data=f"c:{campaign_id}:add")])
         elif status == CampaignStatus.SCHEDULED.value:
@@ -2280,9 +2306,12 @@ class OwnerHandlers:
             if status != CampaignStatus.DRAFT.value:
                 raise ValueError("CTA layout can only be changed in a draft; replace the live variant content or edit a copy.")
             await self._show_button_editor(query.message, campaign, index)
-        elif action == "replace":
+        elif action in {"replace", "repair"}:
             if status not in {CampaignStatus.DRAFT.value, CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
                 raise ValueError("this campaign is not editable in its current state")
+            repair_live = action == "repair"
+            if repair_live and variants[index].get("kind") != "TEXT":
+                raise ValueError("only text variants can be repaired in place; replace this media variant for its next repost")
             await self.repositories.set_owner_session(
                 query.from_user.id,
                 {
@@ -2290,38 +2319,56 @@ class OwnerHandlers:
                     "campaign_id": campaign_id,
                     "variant_index": index,
                     "campaign_status": status,
+                    "repair_live": repair_live,
                 },
             )
             await query.message.answer(
-                f"Replace Variant {index + 1}\n\n"
+                f"{'Repair live posts for' if repair_live else 'Replace'} Variant {index + 1}\n\n"
                 "Send or forward the replacement post. Formatting and media are preserved, and its existing CTA buttons stay attached."
                 + (
-                    " I will preview it and ask for confirmation. The current queued cycle keeps the old revision; the replacement starts next cycle."
+                    " I will preview it and ask for confirmation. This corrected text will be edited into the currently live posts and used for future reposts."
+                    if repair_live
+                    else " I will preview it and ask for confirmation. The current queued cycle keeps the old revision; the replacement starts next cycle."
                     if status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}
                     else ""
                 ),
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:variants")),
             )
-        elif action == "apply":
+        elif action in {"apply", "repairapply"}:
             if status not in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
                 raise ValueError("this live replacement is no longer applicable")
             session = await self.repositories.owner_session(query.from_user.id)
+            repair_live = action == "repairapply"
             if (
                 not session
-                or session.get("action") != "confirm_running_variant_replace"
+                or session.get("action") != ("confirm_running_variant_repair" if repair_live else "confirm_running_variant_replace")
                 or session.get("campaign_id") != campaign_id
                 or int(session.get("variant_index", -1)) != index
             ):
-                raise ValueError("that replacement preview expired; choose Replace again")
+                raise ValueError("that replacement preview expired; choose the variant action again")
             replacement = Creative.model_validate(session["replacement"])
-            updated, applies_from_cycle, has_future = await self.campaigns.replace_running_variant(
-                campaign_id,
-                index,
-                replacement,
-                query.from_user.id,
-            )
+            if repair_live:
+                updated, applies_from_cycle, has_future, queued = await self.campaigns.replace_and_repair_live_text_variant(
+                    campaign_id,
+                    index,
+                    replacement,
+                    query.from_user.id,
+                )
+            else:
+                updated, applies_from_cycle, has_future = await self.campaigns.replace_running_variant(
+                    campaign_id,
+                    index,
+                    replacement,
+                    query.from_user.id,
+                )
             await self.repositories.clear_owner_session(query.from_user.id)
-            if has_future:
+            if repair_live:
+                text = (
+                    f"Variant {index + 1} was corrected and {queued} live text post"
+                    f"{'s are' if queued != 1 else ' is'} queued for in-place repair now. "
+                    "Refresh the campaign dashboard to watch repair progress; future reposts use this corrected revision too."
+                )
+            elif has_future:
                 text = (
                     f"Variant {index + 1} replaced safely. Future planning starts at cycle {applies_from_cycle + 1}; "
                     "the already queued cycle keeps its original revision, and each channel receives the new version when rotation next selects this variant."
@@ -2985,13 +3032,19 @@ class OwnerHandlers:
             await self._show_campaign(message, campaign)
         elif action == "await_replace_creative":
             await self._replace_creative(message, session)
-        elif action == "confirm_running_variant_replace":
+        elif action in {"confirm_running_variant_replace", "confirm_running_variant_repair"}:
             index = int(session["variant_index"])
+            repair_live = action == "confirm_running_variant_repair"
             await message.answer(
-                "Use the Confirm replacement button on the preview above, or cancel and choose Replace again.",
+                "Use the confirmation button on the preview above, or cancel and choose the variant action again.",
                 reply_markup=_markup(
                     [
-                        [InlineKeyboardButton(text="Confirm replacement", callback_data=f"var:{campaign_id}:{index}:apply")],
+                        [
+                            InlineKeyboardButton(
+                                text="Confirm & repair live posts" if repair_live else "Confirm replacement",
+                                callback_data=f"var:{campaign_id}:{index}:{'repairapply' if repair_live else 'apply'}",
+                            )
+                        ],
                         *_navigation(f"c:{campaign_id}:variants"),
                     ]
                 ),
@@ -3259,6 +3312,9 @@ class OwnerHandlers:
         replacement.id = variants[index].id
         replacement.buttons = variants[index].buttons
         replacement.button_layout = variants[index].button_layout
+        repair_live = bool(session.get("repair_live"))
+        if repair_live and replacement.kind != "TEXT":
+            raise ValueError("the live repair action accepts a text post so it can edit every current post in place")
         if campaign["status"] in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
             try:
                 await self.sender.send_variant(message.from_user.id, replacement.model_dump(mode="json"))
@@ -3272,7 +3328,7 @@ class OwnerHandlers:
             await self.repositories.set_owner_session(
                 message.from_user.id,
                 {
-                    "action": "confirm_running_variant_replace",
+                    "action": "confirm_running_variant_repair" if repair_live else "confirm_running_variant_replace",
                     "campaign_id": session["campaign_id"],
                     "variant_index": index,
                     "replacement": replacement.model_dump(mode="json"),
@@ -3280,11 +3336,19 @@ class OwnerHandlers:
             )
             await message.answer(
                 f"Preview for replacement Variant {index + 1}\n\n"
-                "Confirm to use it from the next repost cycle. The current queued cycle and already-live posts are not mixed or changed mid-cycle.",
+                + (
+                    "Confirm to edit this corrected text into the still-live posts now. "
+                    "The edit is durable, rate-limited, and skips any post superseded by a newer repost."
+                    if repair_live
+                    else "Confirm to use it from the next repost cycle. The current queued cycle and already-live posts are not mixed or changed mid-cycle."
+                ),
                 reply_markup=_markup(
                     [
                         [
-                            InlineKeyboardButton(text="Confirm replacement", callback_data=f"var:{session['campaign_id']}:{index}:apply"),
+                            InlineKeyboardButton(
+                                text="Confirm & repair live posts" if repair_live else "Confirm replacement",
+                                callback_data=f"var:{session['campaign_id']}:{index}:{'repairapply' if repair_live else 'apply'}",
+                            ),
                             InlineKeyboardButton(text="Cancel", callback_data=f"c:{session['campaign_id']}:variants"),
                         ],
                         *_navigation(f"c:{session['campaign_id']}:variants"),

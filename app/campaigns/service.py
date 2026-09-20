@@ -590,6 +590,61 @@ class CampaignService:
         )
         return updated, applies_from_cycle, applies_from_cycle < total_cycles
 
+    async def replace_and_repair_live_text_variant(
+        self,
+        campaign_id: str,
+        index: int,
+        replacement: Creative,
+        owner_id: int,
+    ) -> tuple[Document, int, bool, int]:
+        """Version a text variant and queue durable in-place edits for its live posts.
+
+        The replacement is still a normal versioned campaign edit, so future
+        cycles use it too.  Repair jobs are deliberately limited to the live
+        message pointers for this exact variant; a later repost supersedes the
+        pointer and causes any delayed repair to skip rather than edit a new
+        post with stale content.
+        """
+        if replacement.kind != "TEXT":
+            raise ValueError("Only text variants can be repaired in place. Replace media variants for the next repost instead.")
+        updated, applies_from_cycle, has_future = await self.replace_running_variant(
+            campaign_id,
+            index,
+            replacement,
+            owner_id,
+        )
+        variant = updated["variants"][index]
+        repair_id = opaque_id("repair")
+        revision = int(updated.get("variant_current_revisions", {}).get(variant["id"], 1))
+        states = await self.repositories.live_states(campaign_id)
+        queued = await self.repositories.queue_live_text_repairs(
+            campaign_id=campaign_id,
+            repair_id=repair_id,
+            variant_id=variant["id"],
+            variant_index=index,
+            variant_revision=revision,
+            creative=variant,
+            states=states,
+        )
+        now = utcnow()
+        await self.repositories.update_campaign(
+            campaign_id,
+            {
+                "latest_live_text_repair": {
+                    "repair_id": repair_id,
+                    "variant_id": variant["id"],
+                    "variant_index": index,
+                    "variant_revision": revision,
+                    "queued": queued,
+                    "requested_by": owner_id,
+                    "requested_at": now,
+                },
+                "updated_at": now,
+            },
+        )
+        refreshed = await self.repositories.get_campaign(campaign_id)
+        return refreshed or updated, applies_from_cycle, has_future, queued
+
     def _ensure_future_rotation_pass(self, campaign: Document) -> tuple[Document, str | None]:
         """Extend a live rotating run so an edited revision can finish one pass."""
         variants = campaign.get("variants", [])

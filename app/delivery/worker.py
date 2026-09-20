@@ -41,7 +41,16 @@ class DeliveryWorker:
     async def run(self, stopping: asyncio.Event) -> None:
         while not stopping.is_set():
             delivery: dict[str, Any] | None = None
+            repair: dict[str, Any] | None = None
             try:
+                # Repairs are owner-requested corrections of already-live
+                # posts.  They are durable and are intentionally claimed
+                # ahead of ordinary delivery work, while still using the same
+                # global mutation limiter as every other Bot API call.
+                repair = await self.repositories.claim_live_text_repair(self.worker_id, self.delivery_lease_seconds)
+                if repair:
+                    await self.process_live_text_repair(repair)
+                    continue
                 delivery = await self.repositories.claim_delivery(self.worker_id, self.delivery_lease_seconds)
                 if not delivery:
                     await asyncio.sleep(0.25)
@@ -61,8 +70,21 @@ class DeliveryWorker:
             except Exception as error:
                 logger.exception(
                     "Delivery worker iteration failed",
-                    extra={"delivery_id": str(delivery.get("_id")) if delivery else None},
+                    extra={
+                        "delivery_id": str(delivery.get("_id")) if delivery else None,
+                        "repair_id": str(repair.get("_id")) if repair else None,
+                    },
                 )
+                if repair:
+                    try:
+                        await self.repositories.retry_live_text_repair(
+                            repair["_id"],
+                            5,
+                            error_category="WORKER_EXCEPTION",
+                            error_summary=self._safe_error_summary(error),
+                        )
+                    except Exception:
+                        logger.exception("Could not persist live text repair retry state")
                 if delivery:
                     try:
                         await self.repositories.retry_delivery(
@@ -74,6 +96,98 @@ class DeliveryWorker:
                     except Exception:
                         logger.exception("Could not persist worker retry state")
                 await asyncio.sleep(1)
+
+    async def process_live_text_repair(self, repair: dict[str, Any]) -> None:
+        """Apply a confirmed text correction to still-current posts only."""
+        campaign = await self.repositories.get_campaign(repair["campaign_id"])
+        if not campaign or campaign.get("status") not in {"ACTIVE", "PAUSED"}:
+            await self.repositories.complete_live_text_repair(
+                repair["_id"],
+                "SKIPPED",
+                error_category="CAMPAIGN_NOT_REPAIRABLE",
+                error_summary="Campaign is no longer active or paused.",
+            )
+            return
+        state = await self.repositories.live_state(repair["campaign_id"], repair["channel_id"])
+        expected_ids = [int(item) for item in repair.get("message_ids", [])]
+        if (
+            not state
+            or int(state.get("current_variant_index", -1)) != int(repair["variant_index"])
+            or [int(item) for item in state.get("current_message_ids", [])] != expected_ids
+        ):
+            await self.repositories.complete_live_text_repair(
+                repair["_id"],
+                "SKIPPED",
+                error_category="SUPERSEDED",
+                error_summary="The campaign posted a newer message before this repair ran.",
+            )
+            return
+        edited = already_current = 0
+        try:
+            for message_id in expected_ids:
+                await self.mutation_limiter.acquire()
+                try:
+                    await self.sender.edit_live_text_variant(repair["channel_id"], message_id, repair["creative"])
+                    edited += 1
+                except Exception as error:
+                    # A retry can reach a message whose previous edit already
+                    # succeeded.  Telegram's no-change response is therefore
+                    # a successful, idempotent outcome.
+                    if "message is not modified" in str(error).lower():
+                        already_current += 1
+                        continue
+                    raise
+        except Exception as error:
+            decision = classify_telegram_error(error, operation="edit")
+            if decision.kind == ErrorKind.CLEAN_ABSENT:
+                await self.repositories.complete_live_text_repair(
+                    repair["_id"],
+                    "SKIPPED",
+                    edited_message_count=edited,
+                    error_category=decision.category,
+                    error_summary=self._safe_error_summary(error),
+                )
+            elif decision.kind == ErrorKind.PERMANENT:
+                await self.repositories.complete_live_text_repair(
+                    repair["_id"],
+                    "FAILED",
+                    edited_message_count=edited,
+                    error_category=decision.category,
+                    error_summary=self._safe_error_summary(error),
+                )
+                if decision.category == "ACCESS_OR_PERMISSION":
+                    await self.repositories.set_channel_status(
+                        repair["channel_id"],
+                        ChannelStatus.NEEDS_ATTENTION,
+                        last_error_code="LIVE_TEXT_REPAIR_ACCESS",
+                        last_error_at=utcnow(),
+                    )
+            else:
+                await self._retry_or_fail_live_text_repair(repair, decision, error)
+            return
+        await self.repositories.complete_live_text_repair(
+            repair["_id"],
+            "SUCCEEDED",
+            edited_message_count=edited,
+            already_current_count=already_current,
+        )
+
+    async def _retry_or_fail_live_text_repair(self, repair: dict[str, Any], decision: Any, error: Exception) -> None:
+        if int(repair.get("attempts", 0)) >= max(self.max_transient_attempts, 6):
+            await self.repositories.complete_live_text_repair(
+                repair["_id"],
+                "FAILED",
+                error_category="RETRY_EXHAUSTED",
+                error_summary=self._safe_error_summary(error),
+            )
+            return
+        delay = min(300, max(decision.retry_after_seconds or 5, 5) * (2 ** min(max(0, int(repair.get("attempts", 0)) - 1), 5)))
+        await self.repositories.retry_live_text_repair(
+            repair["_id"],
+            delay,
+            error_category=decision.category,
+            error_summary=self._safe_error_summary(error),
+        )
 
     async def process(self, delivery: dict[str, Any]) -> None:
         if delivery.get("operation") == "CLEANUP":

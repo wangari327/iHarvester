@@ -78,6 +78,21 @@ class TelegramSender:
         message = await method(chat_id, file_id, **kwargs)
         return SendResult([message.message_id])
 
+    async def edit_live_text_variant(self, chat_id: int, message_id: int, variant: dict[str, Any]) -> None:
+        """Edit one existing text post without changing its channel position."""
+        creative = Creative.model_validate(variant)
+        if creative.kind != "TEXT":
+            raise ValueError("only text posts can be repaired in place")
+        link_options = LinkPreviewOptions.model_validate(creative.link_preview_options) if creative.link_preview_options else None
+        await self.bot.edit_message_text(
+            creative.text or "",
+            chat_id=chat_id,
+            message_id=message_id,
+            entities=self._entities(creative.entities),
+            reply_markup=audience_markup(creative.buttons, creative.button_layout),
+            link_preview_options=link_options,
+        )
+
     def _album(self, creative: Creative) -> list[Any]:
         items: list[Any] = []
         mapping = {"photo": InputMediaPhoto, "video": InputMediaVideo, "audio": InputMediaAudio, "document": InputMediaDocument}
