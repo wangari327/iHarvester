@@ -31,7 +31,9 @@ class Settings(BaseSettings):
     scheduler_tick_seconds: float = Field(default=2, gt=0)
     telegram_request_timeout_seconds: float = Field(default=20, gt=0)
     max_transient_attempts: int = Field(default=3, ge=1, le=10)
-    default_timezone: str = "UTC"
+    # The operator and primary deployment are based in Nairobi.  Individual
+    # owners can still choose another IANA timezone in Settings.
+    default_timezone: str = "Africa/Nairobi"
     allow_paid_broadcast: bool = False
     auto_backup_enabled: bool = True
     auto_backup_every_new_channels: int = Field(default=100, ge=1)
@@ -77,4 +79,3 @@ class Settings(BaseSettings):
         if not self.resolved_public_base_url or not self.webhook_path_secret:
             return None
         return f"{self.resolved_public_base_url}/telegram/webhook/{self.webhook_path_secret}"
-
