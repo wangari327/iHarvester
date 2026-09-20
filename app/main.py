@@ -22,6 +22,7 @@ from app.db.repositories import Repositories
 from app.delivery.rate_limit import AsyncTokenBucket
 from app.delivery.worker import DeliveryWorker
 from app.telegram.handlers_admin_updates import ChannelAdminHandlers
+from app.telegram.handlers_client_requests import ClientRequestHandlers
 from app.telegram.handlers_join_events import JoinEventHandlers
 from app.telegram.handlers_owner import OwnerHandlers
 from app.telegram.raw_api import RawTelegramAPI
@@ -42,6 +43,7 @@ class Runtime:
     sender: TelegramSender
     stopping: asyncio.Event = field(default_factory=asyncio.Event)
     tasks: list[asyncio.Task[object]] = field(default_factory=list)
+    bot_username: str | None = None
     ready: bool = False
 
 
@@ -64,12 +66,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service = CampaignService(repositories, settings.broadcast_send_rps)
         dispatcher.include_router(ChannelAdminHandlers(repositories).router)
         dispatcher.include_router(JoinEventHandlers(repositories).router)
+        # This narrow public intake must be ahead of the owner router, whose
+        # generic message handler intentionally owns all private owner chats.
+        dispatcher.include_router(ClientRequestHandlers(repositories=repositories, owner_ids=settings.owner_ids).router)
         dispatcher.include_router(
             OwnerHandlers(
                 owner_ids=settings.owner_ids,
                 repositories=repositories,
                 campaigns=service,
                 sender=sender,
+                public_base_url=settings.resolved_public_base_url,
             ).router
         )
         runtime = Runtime(settings, database, repositories, bot, dispatcher, sender)
@@ -90,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await repositories.set_setting(key, value)
             stage = "Telegram bot authentication"
             bot_user = await bot.get_me()
+            runtime.bot_username = bot_user.username
             if not bot_user.supports_inline_queries:
                 logger.warning(
                     "Inline manual sharing is disabled in BotFather; run /setinline for @%s to enable variant share codes",

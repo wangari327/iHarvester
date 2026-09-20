@@ -297,12 +297,20 @@ def _interval_keyboard(
     return _markup(rows)
 
 
-def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, has_live_posts: bool = False) -> InlineKeyboardMarkup:
+def campaign_keyboard(
+    campaign_id: str,
+    status: str,
+    *,
+    variant_count: int = 0,
+    has_live_posts: bool = False,
+    has_schedule: bool = False,
+) -> InlineKeyboardMarkup:
     if status == CampaignStatus.ARCHIVED.value:
         rows = [
             [InlineKeyboardButton(text="Run again now", callback_data=f"c:{campaign_id}:rerun")],
             [InlineKeyboardButton(text="Edit a copy", callback_data=f"c:{campaign_id}:duplicate")],
             [InlineKeyboardButton(text="Full report", callback_data=f"c:{campaign_id}:progress")],
+            [InlineKeyboardButton(text="Share client progress page", callback_data=f"c:{campaign_id}:client")],
         ]
         if has_live_posts:
             rows.append([InlineKeyboardButton(text="Delete retained posts", callback_data=f"c:{campaign_id}:cleanup")])
@@ -321,6 +329,7 @@ def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, 
                 InlineKeyboardButton(text="View campaign report", callback_data=f"c:{campaign_id}:progress"),
             ]
         ]
+        rows.append([InlineKeyboardButton(text="Share client progress page", callback_data=f"c:{campaign_id}:client")])
         rows.append([InlineKeyboardButton(text=f"Variants ({variant_count})", callback_data=f"c:{campaign_id}:variants")])
         if status in {CampaignStatus.ACTIVE.value, CampaignStatus.PAUSED.value}:
             rows.append(
@@ -401,6 +410,8 @@ def campaign_keyboard(campaign_id: str, status: str, *, variant_count: int = 0, 
                 ],
             ]
         )
+        if has_schedule:
+            rows.append([InlineKeyboardButton(text="Review & schedule campaign", callback_data=f"c:{campaign_id}:launch")])
         if variant_count >= 2:
             rows.append([InlineKeyboardButton(text="Rotation mode", callback_data=f"c:{campaign_id}:mode")])
     rows.extend(
@@ -532,11 +543,13 @@ class OwnerHandlers:
         repositories: Repositories,
         campaigns: CampaignService,
         sender: TelegramSender,
+        public_base_url: str | None = None,
     ) -> None:
         self.owner_ids = owner_ids
         self.repositories = repositories
         self.campaigns = campaigns
         self.sender = sender
+        self.public_base_url = public_base_url.rstrip("/") if public_base_url else None
         self.router = Router(name="owner")
         self.router.message.register(self.start, CommandStart())
         self.router.message.register(self.backup, Command("backup"))
@@ -608,13 +621,15 @@ class OwnerHandlers:
     async def _show_home(self, message: Message) -> None:
         channels = await self.repositories.channel_status_counts()
         campaigns = await self.repositories.campaign_status_counts()
+        request_count = await self.repositories.pending_client_promotion_request_count()
         await self._render(
             message,
             "iHarvester control room\n\n"
             f"Active campaigns: {campaigns.get('ACTIVE', 0)}\n"
             f"Scheduled campaigns: {campaigns.get('SCHEDULED', 0)}\n"
             f"Active source channels: {channels.get('ACTIVE', 0)}\n"
-            f"Need attention: {channels.get('NEEDS_ATTENTION', 0)}",
+            f"Need attention: {channels.get('NEEDS_ATTENTION', 0)}\n"
+            f"Client requests: {request_count}",
             home_keyboard(),
         )
 
@@ -732,7 +747,7 @@ class OwnerHandlers:
                     else ""
                 )
                 + f"\n{next_step}",
-                campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants)),
+                campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants), has_schedule=has_schedule),
             )
             return
 
@@ -1174,6 +1189,9 @@ class OwnerHandlers:
             elif data.startswith("c:"):
                 _, campaign_id, action = data.split(":", 2)
                 await self._campaign_action(query, campaign_id, action)
+            elif data.startswith("req:"):
+                _, request_id, action = data.split(":", 2)
+                await self._client_request_action(query, request_id, action)
             elif data.startswith(("mode:", "m:")):
                 _, campaign_id, mode = data.split(":", 2)
                 await self._set_mode(query, campaign_id, mode)
@@ -1421,6 +1439,8 @@ class OwnerHandlers:
                 buttons.append(nav)
             buttons.append([InlineKeyboardButton(text="Home", callback_data="home:back")])
             await self._render(query.message, f"Campaigns • page {page + 1}\nTap a campaign for its full controls.", _markup(buttons))
+        elif action_name == "requests":
+            await self._show_client_requests(query.message, query.from_user.id)
         elif action_name == "back":
             await self._show_home(query.message)
         elif action_name == "backups":
@@ -1453,6 +1473,163 @@ class OwnerHandlers:
         else:
             raise ValueError("that home control is no longer valid")
 
+    async def _share_client_portal(self, query: CallbackQuery, campaign: Document) -> None:
+        if not self.public_base_url:
+            raise ValueError("client pages need PUBLIC_BASE_URL or KOYEB_PUBLIC_DOMAIN to be configured")
+        _, token = await self.repositories.create_campaign_portal_share(query.from_user.id, campaign["campaign_id"])
+        url = f"{self.public_base_url}/client/c/{token}"
+        await query.message.answer(
+            "Client progress page created. It updates its delivery and campaign-time bars automatically while the page is open. "
+            "Anyone with this private link can see only this campaign's aggregate progress and submit an approval-gated request.",
+            reply_markup=_markup(
+                [
+                    [InlineKeyboardButton(text="Copy client link", copy_text=CopyTextButton(text=url))],
+                    [InlineKeyboardButton(text="Open campaign", callback_data=f"c:{campaign['campaign_id']}:open")],
+                    [InlineKeyboardButton(text="Revoke all client links", callback_data=f"c:{campaign['campaign_id']}:revokeclient")],
+                ]
+            ),
+        )
+
+    async def _show_client_requests(self, message: Message, owner_id: int) -> None:
+        requests = await self.repositories.list_client_promotion_requests(owner_id)
+        if not requests:
+            await self._render(
+                message,
+                "Client requests\n\nNothing is waiting for review. Shared campaign pages let clients request a repeat run or send new-promotion materials.",
+                _markup(_navigation()),
+            )
+            return
+        lines = ["Client requests", ""]
+        rows: list[list[InlineKeyboardButton]] = []
+        for index, request in enumerate(requests, start=1):
+            state = str(request.get("status", "")).replace("_", " ").title()
+            client = str(request.get("client_name") or "Unnamed client")
+            kind = str(request.get("request_type") or "").title()
+            materials = len(request.get("materials") or [])
+            lines.append(f"{index}. {client} · {kind} · {state} · {materials} material{'s' if materials != 1 else ''}")
+            rows.append([InlineKeyboardButton(text=f"Open request {index}", callback_data=f"req:{request['request_id']}:open")])
+        rows.extend(_navigation())
+        await self._render(message, "\n".join(lines), _markup(rows))
+
+    async def _client_request_action(self, query: CallbackQuery, request_id: str, action: str) -> None:
+        request = await self.repositories.get_client_promotion_request(request_id, query.from_user.id)
+        if not request:
+            raise ValueError("that client request is no longer available")
+        if action == "open":
+            await self._show_client_request(query.message, request)
+            return
+        if action == "materials":
+            materials = request.get("materials") or []
+            if not materials:
+                await query.message.answer("No materials have been submitted yet.")
+                return
+            await query.message.answer(f"Showing {len(materials)} submitted material item{'s' if len(materials) != 1 else ''}.")
+            for material in materials:
+                await self.sender.send_variant(query.from_user.id, material)
+            return
+        if action == "reject":
+            if not await self.repositories.resolve_client_promotion_request(request_id, query.from_user.id, status="REJECTED"):
+                raise ValueError("that request was already resolved")
+            await query.message.answer("Client request rejected.", reply_markup=home_keyboard())
+            return
+        if action != "approve":
+            raise ValueError("that client request control is no longer valid")
+        if request.get("status") != "PENDING_APPROVAL":
+            raise ValueError("wait for the client to finish submitting materials before approving")
+        if request.get("request_type") == "RERUN":
+            activated = await self._approve_client_rerun(request, query.from_user.id)
+            if not await self.repositories.resolve_client_promotion_request(
+                request_id,
+                query.from_user.id,
+                status="APPROVED",
+                approved_campaign_id=activated["campaign_id"],
+            ):
+                raise ValueError("that request was already resolved")
+            notice = await query.message.answer(
+                f"Approved. {activated['name']} is now {activated['status']}; its saved variants, audience rules, repost plan, and end behavior were retained."
+            )
+            await self._show_campaign(notice, activated)
+            return
+        draft = await self._approve_client_new_request(request, query.from_user.id)
+        if not await self.repositories.resolve_client_promotion_request(
+            request_id,
+            query.from_user.id,
+            status="APPROVED",
+            approved_campaign_id=draft["campaign_id"],
+        ):
+            raise ValueError("that request was already resolved")
+        notice = await query.message.answer(
+            "Approved into a prepared draft. Review the submitted variants, choose timing, preview, then schedule or launch it."
+        )
+        await self._show_campaign(notice, draft)
+
+    async def _show_client_request(self, message: Message, request: Document) -> None:
+        start = request.get("desired_start_at_utc")
+        timezone = str(request.get("client_timezone") or "UTC")
+        lines = [
+            "Client promotion request",
+            "",
+            f"Client: {request.get('client_name') or 'not supplied'}",
+            f"Request: {str(request.get('request_type') or '').title()}",
+            f"Status: {str(request.get('status') or '').replace('_', ' ').title()}",
+            f"Preferred start: {self._date(start, timezone) if start else 'Manager chooses'}",
+            f"Materials: {len(request.get('materials') or [])}",
+            f"Notes: {request.get('details') or 'None'}",
+        ]
+        rows: list[list[InlineKeyboardButton]] = []
+        if request.get("materials"):
+            rows.append([InlineKeyboardButton(text="View submitted materials", callback_data=f"req:{request['request_id']}:materials")])
+        if request.get("status") == "PENDING_APPROVAL":
+            approve_label = "Approve & schedule rerun" if request.get("request_type") == "RERUN" else "Approve into draft"
+            rows.append([InlineKeyboardButton(text=approve_label, callback_data=f"req:{request['request_id']}:approve")])
+        if request.get("status") in {"PENDING_APPROVAL", "AWAITING_MATERIALS"}:
+            rows.append([InlineKeyboardButton(text="Reject request", callback_data=f"req:{request['request_id']}:reject")])
+        rows.extend(_navigation("home:requests"))
+        await self._render(message, "\n".join(lines), _markup(rows))
+
+    async def _approve_client_rerun(self, request: Document, owner_id: int) -> Document:
+        source = await self.repositories.get_campaign(request["campaign_id"])
+        if not source:
+            raise ValueError("the source campaign was deleted")
+        draft = await self.campaigns.fork_to_draft(source["campaign_id"], owner_id)
+        initial_start = as_utc(draft["start_at_utc"])
+        duration = max(timedelta(minutes=1), as_utc(draft["current_end_at_utc"]) - initial_start)
+        requested = request.get("desired_start_at_utc")
+        start = as_utc(requested) if requested and as_utc(requested) > datetime.now(UTC) else datetime.now(UTC)
+        await self.repositories.update_campaign(
+            draft["campaign_id"],
+            {
+                "start_at_utc": start,
+                "original_end_at_utc": start + duration,
+                "current_end_at_utc": start + duration,
+                "rerun_ready": False,
+                "client_request_id": request["request_id"],
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        return await self.campaigns.activate(draft["campaign_id"])
+
+    async def _approve_client_new_request(self, request: Document, owner_id: int) -> Document:
+        materials = list(request.get("materials") or [])
+        if not materials:
+            raise ValueError("the client has not submitted any material")
+        source = await self.repositories.get_campaign(request["campaign_id"])
+        name = f"{request.get('client_name') or 'Client'} promotion"
+        draft = await self.campaigns.create_draft(owner_id, name)
+        await self.repositories.update_campaign(
+            draft["campaign_id"],
+            {
+                "variants": materials,
+                "target_selector": deepcopy(source.get("target_selector", {})) if source else {},
+                "client_request_id": request["request_id"],
+                "client_requested_start_at_utc": request.get("desired_start_at_utc"),
+                "client_notes": request.get("details", ""),
+                "preview_sent": False,
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        return await self.repositories.get_campaign(draft["campaign_id"]) or draft
+
     async def _campaign_action(self, query: CallbackQuery, campaign_id: str, action: str) -> None:
         campaign = await self.repositories.get_campaign(campaign_id)
         if not campaign:
@@ -1466,6 +1643,20 @@ class OwnerHandlers:
             await query.message.answer(
                 f"Add Variant {next_number}\n\nWhat kind of post should this variant contain?",
                 reply_markup=content_type_keyboard(campaign_id),
+            )
+        elif action == "client":
+            await self._share_client_portal(query, campaign)
+        elif action == "revokeclient":
+            revoked = await self.repositories.revoke_campaign_portal_shares(campaign_id, query.from_user.id)
+            await query.message.answer(
+                f"Revoked {revoked} client progress link{'s' if revoked != 1 else ''}.",
+                reply_markup=campaign_keyboard(
+                    campaign_id,
+                    campaign["status"],
+                    variant_count=len(campaign.get("variants", [])),
+                    has_live_posts=bool(await self.repositories.campaign_live_state_count(campaign_id)),
+                    has_schedule=bool(campaign.get("start_at_utc") and campaign.get("current_end_at_utc")),
+                ),
             )
         elif action == "rename":
             await self.campaigns.editable_campaign(campaign_id)
@@ -1507,7 +1698,8 @@ class OwnerHandlers:
                 {"action": "await_schedule_start", "campaign_id": campaign_id, "timezone": timezone},
             )
             await query.message.answer(
-                f"For a future start, send YYYY-MM-DD HH:MM in {timezone}, for example 2026-09-02 09:30.",
+                f"For a future start, send YYYY-MM-DD HH:MM in {timezone}, for example 2026-09-02 09:30. "
+                "I will show this timezone again before scheduling.",
                 reply_markup=_markup(_navigation(f"c:{campaign_id}:open")),
             )
         elif action == "send":
@@ -2293,7 +2485,14 @@ class OwnerHandlers:
             _markup(
                 [
                     [
-                        InlineKeyboardButton(text="Launch now", callback_data=f"confirm:{campaign_id}:launch"),
+                        InlineKeyboardButton(
+                            text=(
+                                f"Schedule for {self._date(campaign['start_at_utc'], display_timezone)}"
+                                if as_utc(campaign["start_at_utc"]) > datetime.now(UTC)
+                                else "Launch now"
+                            ),
+                            callback_data=f"confirm:{campaign_id}:launch",
+                        ),
                         InlineKeyboardButton(text="Cancel", callback_data=f"c:{campaign_id}:open"),
                     ],
                 ]
@@ -2381,10 +2580,16 @@ class OwnerHandlers:
         interval_minutes = int(value)
         duration_minutes = self._duration_minutes(session["start"], session["end"])
         self._validate_repost_interval(duration_minutes, interval_minutes)
-        await self._save_schedule(campaign_id, session["start"], session["end"], interval_minutes)
+        await self._save_schedule(
+            campaign_id,
+            session["start"],
+            session["end"],
+            interval_minutes,
+            owner_timezone=session.get("timezone"),
+        )
         await self.repositories.clear_owner_session(query.from_user.id)
-        notice = await query.message.answer("Schedule saved.")
-        await self._show_campaign(notice, await self.repositories.get_campaign(campaign_id))
+        notice = await query.message.answer("Timing saved. Review and confirm the scheduled launch below.")
+        await self._show_launch_confirmation(notice, campaign_id)
 
     async def _specific_repost_times(self, query: CallbackQuery, campaign_id: str, flow: str) -> None:
         session = await self.repositories.owner_session(query.from_user.id)
@@ -2873,7 +3078,14 @@ class OwnerHandlers:
             if end <= session["start"]:
                 raise ValueError("end time must be after start time")
             await self.repositories.set_owner_session(
-                owner_id, {"action": "await_schedule_interval", "campaign_id": campaign_id, "start": session["start"], "end": end}
+                owner_id,
+                {
+                    "action": "await_schedule_interval",
+                    "campaign_id": campaign_id,
+                    "start": session["start"],
+                    "end": end,
+                    "timezone": session.get("timezone", "UTC"),
+                },
             )
             duration_minutes = self._duration_minutes(session["start"], end)
             await message.answer(
@@ -2885,32 +3097,36 @@ class OwnerHandlers:
             hours = int((message.text or "").strip())
             if hours < 0:
                 raise ValueError("interval cannot be negative")
-            await self._save_schedule(campaign_id, session["start"], session["end"], hours * 60)
+            await self._save_schedule(campaign_id, session["start"], session["end"], hours * 60, owner_timezone=session.get("timezone"))
             await self.repositories.clear_owner_session(owner_id)
-            await message.answer("Schedule saved.")
-            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+            await message.answer("Timing saved. Review and confirm the scheduled launch below.")
+            await self._show_launch_confirmation(message, campaign_id)
         elif action == "await_schedule_interval_custom":
             interval_minutes = parse_period_minutes(message.text or "", field="repost interval")
             duration_minutes = self._duration_minutes(session["start"], session["end"])
             self._validate_repost_interval(duration_minutes, interval_minutes)
-            await self._save_schedule(campaign_id, session["start"], session["end"], interval_minutes)
+            await self._save_schedule(campaign_id, session["start"], session["end"], interval_minutes, owner_timezone=session.get("timezone"))
             await self.repositories.clear_owner_session(owner_id)
-            await message.answer("Schedule saved.")
-            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+            await message.answer("Timing saved. Review and confirm the scheduled launch below.")
+            await self._show_launch_confirmation(message, campaign_id)
         elif action == "await_schedule_repost_times":
             duration_minutes = self._duration_minutes(session["start"], session["end"])
             offsets_minutes, adjusted = build_repost_offsets_minutes(message.text or "", duration_minutes=duration_minutes)
-            final_cleanup = await self._save_schedule(campaign_id, session["start"], session["end"], 0, offsets_minutes)
+            final_cleanup = await self._save_schedule(
+                campaign_id, session["start"], session["end"], 0, offsets_minutes, owner_timezone=session.get("timezone")
+            )
             await self.repositories.clear_owner_session(owner_id)
             await message.answer(self._specific_schedule_saved_text(offsets_minutes, final_cleanup, adjusted))
-            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+            await self._show_launch_confirmation(message, campaign_id)
         elif action == "await_schedule_repost_gaps":
             duration_minutes = self._duration_minutes(session["start"], session["end"])
             offsets_minutes, adjusted = build_repost_gaps_minutes(message.text or "", duration_minutes=duration_minutes)
-            final_cleanup = await self._save_schedule(campaign_id, session["start"], session["end"], 0, offsets_minutes)
+            final_cleanup = await self._save_schedule(
+                campaign_id, session["start"], session["end"], 0, offsets_minutes, owner_timezone=session.get("timezone")
+            )
             await self.repositories.clear_owner_session(owner_id)
             await message.answer(self._specific_schedule_saved_text(offsets_minutes, final_cleanup, adjusted))
-            await self._show_campaign(message, await self.repositories.get_campaign(campaign_id))
+            await self._show_launch_confirmation(message, campaign_id)
         elif action == "await_quick_duration":
             duration_minutes = parse_period_minutes(message.text or "", field="campaign duration")
             await self._begin_quick_interval(owner_id, message, campaign_id, duration_minutes)
@@ -3297,6 +3513,7 @@ class OwnerHandlers:
         end: datetime,
         interval_minutes: int,
         repost_offsets_minutes: list[int] | None = None,
+        owner_timezone: str | None = None,
     ) -> bool:
         interval = interval_minutes * 60 or None
         start = as_utc(start)
@@ -3312,7 +3529,7 @@ class OwnerHandlers:
         delete_on_next_campaign = bool(campaign.get("delete_on_next_campaign", False)) or (
             bool(campaign.get("delete_on_end", True)) and not final_cleanup_available
         )
-        timezone = await self.repositories.get_setting("owner_timezone", "UTC")
+        timezone = owner_timezone or await self.repositories.get_setting("owner_timezone", "UTC")
         await self.repositories.update_campaign(
             campaign_id,
             {

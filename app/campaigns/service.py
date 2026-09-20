@@ -319,6 +319,35 @@ class CampaignService:
             return False
         start = as_utc(campaign["start_at_utc"])
         end = as_utc(campaign["current_end_at_utc"])
+        # A scale-to-zero host cannot tick at the requested moment.  If it
+        # wakes only after the whole scheduled window elapsed and no first
+        # cycle was ever materialized, preserve the owner's intent by giving
+        # that untouched run an equivalent fresh window.  This is deliberately
+        # limited to cycle zero; an interrupted active run uses the normal
+        # durable delivery/repost recovery paths instead.
+        if (
+            campaign["status"] == CampaignStatus.SCHEDULED.value
+            and now >= end
+            and int(campaign.get("next_cycle_number", 0)) == 0
+            and not await self.repositories.cycle_exists(campaign["campaign_id"], 0)
+        ):
+            duration = max(timedelta(minutes=1), end - start)
+            recovered = await self.repositories.rebase_unstarted_scheduled_campaign(
+                campaign["campaign_id"],
+                campaign["start_at_utc"],
+                {
+                    "start_at_utc": now,
+                    "original_end_at_utc": now + duration,
+                    "current_end_at_utc": now + duration,
+                    "schedule_recovered_at": now,
+                    "schedule_delayed_by_seconds": max(0, int((now - start).total_seconds())),
+                    "updated_at": now,
+                },
+            )
+            if recovered:
+                campaign = recovered
+                start = as_utc(campaign["start_at_utc"])
+                end = as_utc(campaign["current_end_at_utc"])
         if now < start:
             return False
         if now >= end:

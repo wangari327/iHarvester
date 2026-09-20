@@ -37,6 +37,9 @@ class MemoryRepositories:
         self.deliveries.extend(row for row in deliveries if (row["cycle_number"], row["channel_id"]) not in existing)
         return True
 
+    async def cycle_exists(self, campaign_id, cycle_number):
+        return any(cycle["cycle_number"] == cycle_number for cycle in self.cycles)
+
     async def update_campaign(self, campaign_id, update):
         self.campaign.update(update)
         return True
@@ -49,6 +52,16 @@ class MemoryRepositories:
 
     async def activate_draft(self, campaign_id, update):
         if self.campaign.get("status") != "DRAFT":
+            return None
+        self.campaign.update(update)
+        return self.campaign
+
+    async def rebase_unstarted_scheduled_campaign(self, campaign_id, expected_start, update):
+        if (
+            self.campaign.get("status") != "SCHEDULED"
+            or self.campaign.get("start_at_utc") != expected_start
+            or self.campaign.get("next_cycle_number") != 0
+        ):
             return None
         self.campaign.update(update)
         return self.campaign
@@ -492,3 +505,36 @@ async def test_transient_immediate_cycle_failure_does_not_report_atomic_activati
 
     assert activated["status"] == "ACTIVE"
     assert activated["next_cycle_number"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unstarted_schedule_is_rebased_after_the_host_misses_its_entire_window() -> None:
+    original_start = datetime(2026, 9, 1, 8, tzinfo=UTC)
+    original_end = original_start + timedelta(hours=2)
+    wake_time = original_end + timedelta(hours=3)
+    campaign = {
+        "campaign_id": "cmp_sleep_recovery",
+        "status": "SCHEDULED",
+        "mode": "STANDARD",
+        "variants": [{"id": "var_1", "kind": "TEXT", "text": "Recovered"}],
+        "start_at_utc": original_start,
+        "original_end_at_utc": original_end,
+        "current_end_at_utc": original_end,
+        "repost_interval_seconds": None,
+        "repost_offsets_seconds": None,
+        "delete_on_end": False,
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"r" * 32).decode(),
+        "next_cycle_number": 0,
+    }
+    repositories = MemoryRepositories(campaign, [])
+
+    planned = await CampaignService(repositories, 20).plan_due_cycle(campaign, wake_time)
+
+    assert planned is True
+    assert repositories.campaign["start_at_utc"] == wake_time
+    assert repositories.campaign["current_end_at_utc"] == wake_time + timedelta(hours=2)
+    assert repositories.campaign["schedule_delayed_by_seconds"] == 5 * 3600
+    assert len(repositories.cycles) == 1
+    assert len(repositories.deliveries) == 1

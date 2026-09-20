@@ -46,5 +46,6 @@ def home_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="Campaigns", callback_data="home:campaigns")],
         [InlineKeyboardButton(text="Network", callback_data="home:network"),
          InlineKeyboardButton(text="Backups", callback_data="home:backups")],
+        [InlineKeyboardButton(text="Client requests", callback_data="home:requests")],
         [InlineKeyboardButton(text="Settings", callback_data="home:settings")],
     ])

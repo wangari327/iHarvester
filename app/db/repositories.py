@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import secrets
 from datetime import timedelta
+from hashlib import sha256
 from typing import Any
 
 from pymongo import ASCENDING, ReturnDocument, UpdateOne
@@ -254,6 +256,24 @@ class Repositories:
         """Atomically win activation so repeated Launch callbacks cannot race."""
         return await self.db.campaigns.find_one_and_update(
             {"campaign_id": campaign_id, "status": "DRAFT"},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def rebase_unstarted_scheduled_campaign(
+        self,
+        campaign_id: str,
+        expected_start: Any,
+        update: Document,
+    ) -> Document | None:
+        """Recover a schedule whose entire window elapsed while the host slept."""
+        return await self.db.campaigns.find_one_and_update(
+            {
+                "campaign_id": campaign_id,
+                "status": "SCHEDULED",
+                "start_at_utc": expected_start,
+                "next_cycle_number": 0,
+            },
             {"$set": update},
             return_document=ReturnDocument.AFTER,
         )
@@ -1031,6 +1051,203 @@ class Repositories:
     async def clear_owner_session(self, owner_id: int) -> None:
         await self.db.owner_sessions.delete_one({"owner_id": owner_id})
 
+    @staticmethod
+    def _token_hash(token: str) -> str:
+        return sha256(token.encode("utf-8")).hexdigest()
+
+    async def create_campaign_portal_share(self, owner_id: int, campaign_id: str) -> tuple[Document, str]:
+        """Create a new revocable, high-entropy client progress link."""
+        if not await self.db.campaigns.count_documents({"campaign_id": campaign_id}, limit=1):
+            raise ValueError("campaign no longer exists")
+        now = utcnow()
+        for _ in range(5):
+            token = secrets.token_urlsafe(32)
+            document: Document = {
+                "share_id": f"portal_{secrets.token_hex(10)}",
+                "campaign_id": campaign_id,
+                "owner_id": owner_id,
+                "token_hash": self._token_hash(token),
+                "created_at": now,
+                "updated_at": now,
+                "last_opened_at": None,
+                "revoked_at": None,
+            }
+            try:
+                await self.db.campaign_portal_shares.insert_one(document)
+                return document, token
+            except DuplicateKeyError:
+                continue
+        raise RuntimeError("could not allocate a client portal link")
+
+    async def campaign_portal_share(self, token: str) -> Document | None:
+        now = utcnow()
+        share = await self.db.campaign_portal_shares.find_one(
+            {"token_hash": self._token_hash(token), "revoked_at": None}
+        )
+        if share:
+            await self.db.campaign_portal_shares.update_one(
+                {"_id": share["_id"]}, {"$set": {"last_opened_at": now, "updated_at": now}}
+            )
+        return share
+
+    async def revoke_campaign_portal_shares(self, campaign_id: str, owner_id: int) -> int:
+        result = await self.db.campaign_portal_shares.update_many(
+            {"campaign_id": campaign_id, "owner_id": owner_id, "revoked_at": None},
+            {"$set": {"revoked_at": utcnow(), "updated_at": utcnow()}},
+        )
+        return result.modified_count
+
+    async def create_client_promotion_request(
+        self,
+        *,
+        share: Document,
+        request_type: str,
+        client_name: str,
+        details: str,
+        desired_start_at_utc: Any | None,
+        client_timezone: str,
+    ) -> tuple[Document, str]:
+        if request_type not in {"RERUN", "NEW"}:
+            raise ValueError("invalid promotion request type")
+        now = utcnow()
+        request_id = f"r{secrets.token_hex(8)}"
+        material_token = secrets.token_hex(12)
+        document: Document = {
+            "request_id": request_id,
+            "share_id": share["share_id"],
+            "campaign_id": share["campaign_id"],
+            "owner_id": share["owner_id"],
+            "request_type": request_type,
+            "client_name": client_name.strip()[:100],
+            "details": details.strip()[:3000],
+            "desired_start_at_utc": desired_start_at_utc,
+            "client_timezone": client_timezone,
+            "status": "PENDING_APPROVAL" if request_type == "RERUN" else "AWAITING_MATERIALS",
+            "materials": [],
+            "material_token_hash": self._token_hash(material_token),
+            "submitter_user_id": None,
+            "created_at": now,
+            "updated_at": now,
+            "approved_at": None,
+            "rejected_at": None,
+        }
+        await self.db.client_promotion_requests.insert_one(document)
+        return document, material_token
+
+    async def get_client_promotion_request(self, request_id: str, owner_id: int | None = None) -> Document | None:
+        query: Document = {"request_id": request_id}
+        if owner_id is not None:
+            query["owner_id"] = owner_id
+        return await self.db.client_promotion_requests.find_one(query)
+
+    async def list_client_promotion_requests(self, owner_id: int, *, skip: int = 0, limit: int = 8) -> list[Document]:
+        return await self.db.client_promotion_requests.find(
+            {"owner_id": owner_id, "status": {"$in": ["AWAITING_MATERIALS", "PENDING_APPROVAL"]}}
+        ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    async def client_promotion_request_counts(self, owner_id: int) -> Document:
+        cursor = await self.db.client_promotion_requests.aggregate(
+            [
+                {"$match": {"owner_id": owner_id, "status": {"$in": ["AWAITING_MATERIALS", "PENDING_APPROVAL"]}}},
+                {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ],
+        )
+        rows = await cursor.to_list(None)
+        return {row["_id"]: row["count"] for row in rows}
+
+    async def pending_client_promotion_request_count(self) -> int:
+        return await self.db.client_promotion_requests.count_documents(
+            {"status": {"$in": ["AWAITING_MATERIALS", "PENDING_APPROVAL"]}}
+        )
+
+    async def begin_client_material_session(self, request_id: str, material_token: str, user_id: int) -> Document | None:
+        """Bind material uploads to the first Telegram user who opens its link."""
+        now = utcnow()
+        request = await self.db.client_promotion_requests.find_one_and_update(
+            {
+                "request_id": request_id,
+                "material_token_hash": self._token_hash(material_token),
+                "status": "AWAITING_MATERIALS",
+                "$or": [{"submitter_user_id": None}, {"submitter_user_id": user_id}],
+            },
+            {"$set": {"submitter_user_id": user_id, "updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not request:
+            return None
+        await self.db.client_material_sessions.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "user_id": user_id,
+                    "request_id": request_id,
+                    "updated_at": now,
+                    "expires_at": now + timedelta(hours=24),
+                }
+            },
+            upsert=True,
+        )
+        return request
+
+    async def client_material_session(self, user_id: int) -> Document | None:
+        return await self.db.client_material_sessions.find_one({"user_id": user_id, "expires_at": {"$gt": utcnow()}})
+
+    async def append_client_request_material(self, request_id: str, user_id: int, material: Document) -> Document | None:
+        now = utcnow()
+        return await self.db.client_promotion_requests.find_one_and_update(
+            {
+                "request_id": request_id,
+                "submitter_user_id": user_id,
+                "status": "AWAITING_MATERIALS",
+                "$expr": {"$lt": [{"$size": {"$ifNull": ["$materials", []]}}, 20]},
+            },
+            {"$push": {"materials": material}, "$set": {"updated_at": now}},
+            return_document=ReturnDocument.AFTER,
+        )
+
+    async def finish_client_material_session(self, request_id: str, user_id: int) -> Document | None:
+        request = await self.db.client_promotion_requests.find_one_and_update(
+            {
+                "request_id": request_id,
+                "submitter_user_id": user_id,
+                "status": "AWAITING_MATERIALS",
+                "$expr": {"$gt": [{"$size": {"$ifNull": ["$materials", []]}}, 0]},
+            },
+            {"$set": {"status": "PENDING_APPROVAL", "materials_completed_at": utcnow(), "updated_at": utcnow()}},
+            return_document=ReturnDocument.AFTER,
+        )
+        await self.db.client_material_sessions.delete_one({"user_id": user_id, "request_id": request_id})
+        return request
+
+    async def cancel_client_material_session(self, user_id: int) -> None:
+        await self.db.client_material_sessions.delete_one({"user_id": user_id})
+
+    async def resolve_client_promotion_request(
+        self,
+        request_id: str,
+        owner_id: int,
+        *,
+        status: str,
+        approved_campaign_id: str | None = None,
+    ) -> bool:
+        if status not in {"APPROVED", "REJECTED"}:
+            raise ValueError("invalid request resolution")
+        now = utcnow()
+        pending_statuses = ["PENDING_APPROVAL"] if status == "APPROVED" else ["PENDING_APPROVAL", "AWAITING_MATERIALS"]
+        result = await self.db.client_promotion_requests.update_one(
+            {"request_id": request_id, "owner_id": owner_id, "status": {"$in": pending_statuses}},
+            {
+                "$set": {
+                    "status": status,
+                    "updated_at": now,
+                    "approved_at": now if status == "APPROVED" else None,
+                    "rejected_at": now if status == "REJECTED" else None,
+                    "approved_campaign_id": approved_campaign_id,
+                }
+            },
+        )
+        return result.modified_count == 1
+
     async def list_campaigns(self, limit: int = 20, *, skip: int = 0) -> list[Document]:
         return await self.db.campaigns.find({}).sort("updated_at", -1).skip(skip).limit(limit).to_list(limit)
 
@@ -1084,6 +1301,8 @@ class Repositories:
         result = await self.db.campaigns.delete_one({"campaign_id": campaign_id, "status": "ARCHIVED"})
         if result.deleted_count:
             await self.db.variant_shares.delete_many(campaign_query)
+            await self.db.campaign_portal_shares.delete_many(campaign_query)
+            await self.db.client_promotion_requests.delete_many(campaign_query)
         return result.deleted_count == 1
 
     async def save_pending_restore(self, restore_id: str, owner_id: int, backup: Document) -> None:

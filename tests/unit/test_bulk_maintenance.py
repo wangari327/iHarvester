@@ -84,6 +84,8 @@ def deletion_repositories(*, live_count: int = 0) -> tuple[Repositories, SimpleN
         join_events=DeleteCollection(),
         campaign_channel_state=DeleteCollection(count=live_count),
         variant_shares=DeleteCollection(),
+        campaign_portal_shares=DeleteCollection(),
+        client_promotion_requests=DeleteCollection(),
     )
     repositories = Repositories.__new__(Repositories)
     repositories.db = db
@@ -102,6 +104,8 @@ async def test_archived_deletion_cascades_finished_campaign_history() -> None:
     assert db.join_events.deleted_many == expected
     assert db.campaign_channel_state.deleted_many == expected
     assert db.variant_shares.deleted_many == expected
+    assert db.campaign_portal_shares.deleted_many == expected
+    assert db.client_promotion_requests.deleted_many == expected
     assert db.campaigns.deleted_one == [{"campaign_id": "cmp", "status": "ARCHIVED"}]
 
 

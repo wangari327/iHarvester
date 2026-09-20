@@ -31,3 +31,12 @@ async def ensure_indexes(database: Database) -> None:
     )
     await db.variant_shares.create_index([("owner_id", 1), ("campaign_id", 1), ("variant_id", 1), ("created_at", -1)])
     await db.variant_shares.create_index("purge_at", expireAfterSeconds=0)
+    # Client-facing progress pages use a long opaque bearer token.  Only its
+    # digest is stored, so exporting the database cannot reveal a live link.
+    await db.campaign_portal_shares.create_index("token_hash", unique=True)
+    await db.campaign_portal_shares.create_index([("campaign_id", 1), ("revoked_at", 1)])
+    await db.client_promotion_requests.create_index("request_id", unique=True)
+    await db.client_promotion_requests.create_index([("owner_id", 1), ("status", 1), ("created_at", -1)])
+    await db.client_promotion_requests.create_index("material_token_hash", unique=True)
+    await db.client_material_sessions.create_index("user_id", unique=True)
+    await db.client_material_sessions.create_index("expires_at", expireAfterSeconds=0)
