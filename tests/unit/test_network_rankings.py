@@ -92,17 +92,47 @@ async def test_top_channels_screen_formats_rank_status_coverage_and_toggle() -> 
 
 
 @pytest.mark.asyncio
-async def test_network_home_exposes_the_top_channels_section() -> None:
+async def test_network_home_exposes_refresh_and_split_rankings() -> None:
     handlers = OwnerHandlers.__new__(OwnerHandlers)
     handlers.repositories = SimpleNamespace(
-        channel_status_counts=AsyncMock(return_value={"ACTIVE": 600, "NEEDS_ATTENTION": 12})
+        channel_status_counts=AsyncMock(return_value={"ACTIVE": 600, "NEEDS_ATTENTION": 12}),
+        channel_visibility_counts=AsyncMock(return_value={"public": 450, "private": 162}),
+        latest_network_refresh=AsyncMock(return_value=None),
     )
     handlers._render = AsyncMock()
 
     await handlers._show_network(object())
 
     markup = handlers._render.await_args.args[2]
-    assert "Top channels by subscribers" in {button.text for row in markup.inline_keyboard for button in row}
+    controls = {button.text for row in markup.inline_keyboard for button in row}
+    assert {"Refresh all network stats", "Top public channels", "Top private channels"} <= controls
+
+
+@pytest.mark.asyncio
+async def test_split_rankings_are_paginated_and_keep_unknown_counts_after_the_ranked_rows() -> None:
+    repositories = SimpleNamespace(
+        ranked_channel_count=AsyncMock(return_value=23),
+        ranked_channels_by_members=AsyncMock(
+            return_value=[
+                {"telegram_chat_id": -1001, "title": "Largest public", "member_count": 123_456, "status": "ACTIVE"},
+                {"telegram_chat_id": -1002, "title": "Unknown count", "member_count": None, "status": "NEEDS_ATTENTION"},
+            ]
+        ),
+        channel_member_count_coverage=AsyncMock(return_value=(21, 2)),
+    )
+    handlers = OwnerHandlers.__new__(OwnerHandlers)
+    handlers.repositories = repositories
+    handlers._render = AsyncMock()
+
+    await handlers._show_ranked_channels(object(), "public", 1)
+
+    _, text, markup = handlers._render.await_args.args
+    assert "Top public channels by subscribers (page 2/3)" in text
+    assert "11. Largest public — 123,456 subscribers" in text
+    assert "12. Unknown count — unknown subscribers" in text
+    controls = {button.text for row in markup.inline_keyboard for button in row}
+    assert {"Previous", "Next", "Top private channels", "Back to Network"} <= controls
+    repositories.ranked_channels_by_members.assert_awaited_once_with(is_public=True, skip=10, limit=10)
 
 
 @pytest.mark.asyncio

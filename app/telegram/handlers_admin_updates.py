@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from aiogram import Bot, Router
 from aiogram.enums import ChatMemberStatus
 from aiogram.types import Chat, ChatMember, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -11,11 +13,26 @@ from app.db.repositories import Repositories
 from app.utils.time import utcnow
 
 
-async def refresh_channel(bot: Bot, repositories: Repositories, chat_id: int, chat: Chat | None = None) -> bool:
+async def refresh_channel(
+    bot: Bot,
+    repositories: Repositories,
+    chat_id: int,
+    chat: Chat | None = None,
+    *,
+    request_limiter: Any | None = None,
+    preserve_manual_pause: bool = False,
+) -> bool:
+    async def request(call):
+        if request_limiter:
+            await request_limiter.acquire()
+        return await call
+
+    existing = await repositories.get_channel(chat_id) if preserve_manual_pause else None
+    keep_paused = bool(existing and existing.get("status") == ChannelStatus.INACTIVE_MANUAL.value)
     try:
-        chat = chat or await bot.get_chat(chat_id)
-        member: ChatMember = await bot.get_chat_member(chat_id, bot.id)
-        member_count = await bot.get_chat_member_count(chat_id)
+        chat = chat or await request(bot.get_chat(chat_id))
+        member: ChatMember = await request(bot.get_chat_member(chat_id, bot.id))
+        member_count = await request(bot.get_chat_member_count(chat_id))
     except Exception:
         if chat:
             await repositories.upsert_channel(
@@ -26,7 +43,7 @@ async def refresh_channel(bot: Bot, repositories: Repositories, chat_id: int, ch
                     "type": "channel",
                     "is_public": bool(chat.username),
                     "member_count": None,
-                    "status": ChannelStatus.NEEDS_ATTENTION.value,
+                    "status": ChannelStatus.INACTIVE_MANUAL.value if keep_paused else ChannelStatus.NEEDS_ATTENTION.value,
                     "permissions": {
                         "is_admin": False,
                         "can_post_messages": False,
@@ -38,11 +55,21 @@ async def refresh_channel(bot: Bot, repositories: Repositories, chat_id: int, ch
                 }
             )
         else:
-            await repositories.set_channel_status(chat_id, ChannelStatus.NEEDS_ATTENTION, last_error_code="REFRESH_FAILED")
+            await repositories.set_channel_status(
+                chat_id,
+                ChannelStatus.INACTIVE_MANUAL if keep_paused else ChannelStatus.NEEDS_ATTENTION,
+                last_error_code="REFRESH_FAILED",
+            )
         return False
     is_admin = member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
     can_post = bool(getattr(member, "can_post_messages", is_admin))
-    status = ChannelStatus.ACTIVE if is_admin and can_post else ChannelStatus.UNAVAILABLE
+    status = (
+        ChannelStatus.INACTIVE_MANUAL
+        if keep_paused and is_admin and can_post
+        else ChannelStatus.ACTIVE
+        if is_admin and can_post
+        else ChannelStatus.UNAVAILABLE
+    )
     await repositories.upsert_channel(
         {
             "telegram_chat_id": chat.id,

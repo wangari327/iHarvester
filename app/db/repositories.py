@@ -99,10 +99,54 @@ class Repositories:
             [("member_count", -1), ("title", ASCENDING)]
         ).limit(safe_limit).to_list(safe_limit)
 
-    async def channel_member_count_coverage(self) -> tuple[int, int]:
-        known = await self.db.channels.count_documents({"member_count": {"$type": "number"}})
-        total = await self.db.channels.count_documents({})
+    @staticmethod
+    def _channel_visibility_query(is_public: bool) -> Document:
+        """Include legacy rows that predate the explicit is_public field."""
+        if is_public:
+            return {
+                "$or": [
+                    {"is_public": True},
+                    {"is_public": {"$exists": False}, "username": {"$type": "string", "$ne": ""}},
+                ]
+            }
+        return {
+            "$or": [
+                {"is_public": False},
+                {"is_public": {"$exists": False}, "username": None},
+                {"is_public": {"$exists": False}, "username": {"$exists": False}},
+            ]
+        }
+
+    async def ranked_channels_by_members(
+        self,
+        *,
+        is_public: bool,
+        skip: int = 0,
+        limit: int = 10,
+    ) -> list[Document]:
+        """Return a complete public/private ranking, with unknown counts last."""
+        safe_skip = max(0, int(skip))
+        safe_limit = max(1, min(int(limit), 20))
+        return await self.db.channels.find(self._channel_visibility_query(is_public)).sort(
+            [("member_count", -1), ("title", ASCENDING)]
+        ).skip(safe_skip).limit(safe_limit).to_list(safe_limit)
+
+    async def ranked_channel_count(self, *, is_public: bool) -> int:
+        return await self.db.channels.count_documents(self._channel_visibility_query(is_public))
+
+    async def channel_member_count_coverage(self, is_public: bool | None = None) -> tuple[int, int]:
+        visibility = self._channel_visibility_query(is_public) if is_public is not None else {}
+        known_query: Document = {"member_count": {"$type": "number"}}
+        if visibility:
+            known_query = {"$and": [visibility, known_query]}
+        known = await self.db.channels.count_documents(known_query)
+        total = await self.db.channels.count_documents(visibility)
         return known, max(0, total - known)
+
+    async def channel_visibility_counts(self) -> Document:
+        public = await self.ranked_channel_count(is_public=True)
+        private = await self.ranked_channel_count(is_public=False)
+        return {"public": public, "private": private}
 
     async def channel_ids_by_status(self, status: str) -> list[int]:
         rows = await self.db.channels.find(
@@ -110,6 +154,127 @@ class Repositories:
             {"_id": 0, "telegram_chat_id": 1},
         ).to_list(None)
         return [int(row["telegram_chat_id"]) for row in rows]
+
+    async def start_network_refresh(self, owner_id: int) -> tuple[Document, bool]:
+        """Create one durable full-registry refresh, or return the active run.
+
+        Member counts and bot permissions change outside Telegram update events.
+        The work is consequently queued one channel at a time and can survive
+        a deployment restart without losing the operator's request.
+        """
+        if active := await self.db.network_refresh_runs.find_one({"status": {"$in": ["QUEUED", "RUNNING"]}}):
+            return active, False
+        rows = await self.db.channels.find({}, {"_id": 0, "telegram_chat_id": 1}).to_list(None)
+        now = utcnow()
+        run: Document = {
+            "refresh_id": f"netrefresh_{secrets.token_urlsafe(9)}",
+            "owner_id": owner_id,
+            "status": "QUEUED" if rows else "COMPLETED",
+            "total": len(rows),
+            "requested_at": now,
+            "started_at": None,
+            "completed_at": now if not rows else None,
+            "updated_at": now,
+        }
+        await self.db.network_refresh_runs.insert_one(run)
+        operations = [
+            UpdateOne(
+                {"refresh_id": run["refresh_id"], "channel_id": int(row["telegram_chat_id"])},
+                {
+                    "$setOnInsert": {
+                        "refresh_id": run["refresh_id"],
+                        "channel_id": int(row["telegram_chat_id"]),
+                        "status": "PENDING",
+                        "attempts": 0,
+                        "worker_id": None,
+                        "lease_until": None,
+                        "next_retry_at": None,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                },
+                upsert=True,
+            )
+            for row in rows
+        ]
+        for offset in range(0, len(operations), 500):
+            await self.db.network_refresh_jobs.bulk_write(operations[offset : offset + 500], ordered=False)
+        return run, True
+
+    async def latest_network_refresh(self) -> Document | None:
+        return await self.db.network_refresh_runs.find_one({}, sort=[("requested_at", -1)])
+
+    async def network_refresh_summary(self, refresh_id: str) -> Document:
+        cursor = await self.db.network_refresh_jobs.aggregate(
+            [
+                {"$match": {"refresh_id": refresh_id}},
+                {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ]
+        )
+        rows = await cursor.to_list(None)
+        return {str(row["_id"]): int(row["count"]) for row in rows}
+
+    async def claim_network_refresh_job(self, worker_id: str, lease_seconds: int) -> Document | None:
+        now = utcnow()
+        job = await self.db.network_refresh_jobs.find_one_and_update(
+            {
+                "$or": [
+                    {"status": "PENDING"},
+                    {"status": "RETRY_WAIT", "next_retry_at": {"$lte": now}},
+                    {"status": "PROCESSING", "lease_until": {"$lte": now}},
+                ]
+            },
+            {
+                "$set": {
+                    "status": "PROCESSING",
+                    "worker_id": worker_id,
+                    "lease_until": now + timedelta(seconds=lease_seconds),
+                    "updated_at": now,
+                },
+                "$inc": {"attempts": 1},
+            },
+            sort=[("created_at", ASCENDING)],
+            return_document=ReturnDocument.AFTER,
+        )
+        if job:
+            await self.db.network_refresh_runs.update_one(
+                {"refresh_id": job["refresh_id"], "status": "QUEUED"},
+                {"$set": {"status": "RUNNING", "started_at": now, "updated_at": now}},
+            )
+        return job
+
+    async def complete_network_refresh_job(self, job_id: Any, status: str, **details: Any) -> None:
+        job = await self.db.network_refresh_jobs.find_one_and_update(
+            {"_id": job_id},
+            {"$set": {"status": status, "lease_until": None, "updated_at": utcnow(), **details}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not job:
+            return
+        outstanding = await self.db.network_refresh_jobs.count_documents(
+            {"refresh_id": job["refresh_id"], "status": {"$in": ["PENDING", "PROCESSING", "RETRY_WAIT"]}},
+            limit=1,
+        )
+        if not outstanding:
+            await self.db.network_refresh_runs.update_one(
+                {"refresh_id": job["refresh_id"]},
+                {"$set": {"status": "COMPLETED", "completed_at": utcnow(), "updated_at": utcnow()}},
+            )
+
+    async def retry_network_refresh_job(self, job_id: Any, retry_after_seconds: float, **details: Any) -> None:
+        now = utcnow()
+        await self.db.network_refresh_jobs.update_one(
+            {"_id": job_id},
+            {
+                "$set": {
+                    "status": "RETRY_WAIT",
+                    "lease_until": None,
+                    "next_retry_at": now + timedelta(seconds=retry_after_seconds),
+                    "updated_at": now,
+                    **details,
+                }
+            },
+        )
 
     async def set_channel_tags(self, chat_id: int, tags: list[str]) -> None:
         await self.db.channels.update_one(

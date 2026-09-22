@@ -931,13 +931,27 @@ class OwnerHandlers:
 
     async def _show_network(self, message: Message, *, notice: str | None = None) -> None:
         counts = await self.repositories.channel_status_counts()
+        visibility = await self.repositories.channel_visibility_counts()
+        latest_refresh = await self.repositories.latest_network_refresh()
+        refresh_text = "Member counts reflect each channel's last successful check."
+        if latest_refresh:
+            refresh_summary = await self.repositories.network_refresh_summary(latest_refresh["refresh_id"])
+            total = int(latest_refresh.get("total", 0))
+            completed = sum(refresh_summary.get(item, 0) for item in ("COMPLETED", "FAILED"))
+            if latest_refresh.get("status") in {"QUEUED", "RUNNING"}:
+                waiting = sum(refresh_summary.get(item, 0) for item in ("PENDING", "PROCESSING", "RETRY_WAIT"))
+                refresh_text = f"Network refresh: {self._bar(completed, total, 8)}  {completed}/{total} checked ({waiting} waiting)."
+            elif latest_refresh.get("completed_at"):
+                refresh_text = f"Full network refresh completed: {self._date(latest_refresh['completed_at'])}."
         text = (
             (f"{notice}\n\n" if notice else "") + "Network registry\n\n"
             f"Active: {counts.get('ACTIVE', 0)}\n"
             f"Needs attention: {counts.get('NEEDS_ATTENTION', 0)}\n"
             f"Unavailable: {counts.get('UNAVAILABLE', 0)}\n"
             f"Paused manually: {counts.get('INACTIVE_MANUAL', 0)}\n"
+            f"Public: {visibility.get('public', 0)}  |  Private: {visibility.get('private', 0)}\n"
             f"Total discovered: {sum(counts.values())}\n\n"
+            f"{refresh_text}\n\n"
             "Add me as a channel admin to register automatically, or forward a channel post here to repair/register it."
         )
         controls = [
@@ -961,7 +975,11 @@ class OwnerHandlers:
             )
         controls.extend(
             [
-                [InlineKeyboardButton(text="Top channels by subscribers", callback_data="net:top:15")],
+                [InlineKeyboardButton(text="Refresh all network stats", callback_data="net:refresh_all")],
+                [
+                    InlineKeyboardButton(text="Top public channels", callback_data="net:rank:public:0"),
+                    InlineKeyboardButton(text="Top private channels", callback_data="net:rank:private:0"),
+                ],
                 [InlineKeyboardButton(text="Forward post to register", callback_data="net:forward")],
                 [InlineKeyboardButton(text="Back", callback_data="home:back")],
             ]
@@ -1002,6 +1020,63 @@ class OwnerHandlers:
         if nav:
             controls.append(nav)
         controls.append([InlineKeyboardButton(text="Back to Network", callback_data="net:home")])
+        await self._render(message, "\n".join(lines), _markup(controls))
+
+    async def _show_ranked_channels(self, message: Message, visibility: str, page: int) -> None:
+        if visibility not in {"public", "private"}:
+            raise ValueError("choose public or private channels")
+        is_public = visibility == "public"
+        page_size = 10
+        page = max(0, page)
+        total = await self.repositories.ranked_channel_count(is_public=is_public)
+        channels = await self.repositories.ranked_channels_by_members(
+            is_public=is_public,
+            skip=page * page_size,
+            limit=page_size,
+        )
+        known_count, unknown_count = await self.repositories.channel_member_count_coverage(is_public=is_public)
+        if not channels:
+            await self._render(
+                message,
+                f"Top {visibility} channels\n\nNo {visibility} channels are registered yet.",
+                _markup(_navigation("net:home")),
+            )
+            return
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        lines = [f"Top {visibility} channels by subscribers (page {page + 1}/{total_pages})", ""]
+        controls: list[list[InlineKeyboardButton]] = []
+        for rank, channel in enumerate(channels, start=page * page_size + 1):
+            title = " ".join(str(channel.get("title") or channel["telegram_chat_id"]).split())[:36]
+            status = str(channel.get("status") or "UNKNOWN").replace("_", " ").title()
+            members = f"{int(channel['member_count']):,}" if isinstance(channel.get("member_count"), (int, float)) else "unknown"
+            lines.append(f"{rank}. {title} — {members} subscribers • {status}")
+            controls.append([InlineKeyboardButton(text=f"Open #{rank}", callback_data=f"chan:{channel['telegram_chat_id']}:view")])
+        lines.extend(
+            [
+                "",
+                f"{known_count:,}/{total:,} have verified subscriber counts. "
+                f"{unknown_count:,} unknown-count channel{'s appear' if unknown_count != 1 else ' appears'} after ranked entries.",
+                "Use Refresh all network stats to update membership and access in the background.",
+            ]
+        )
+        nav: list[InlineKeyboardButton] = []
+        if page:
+            nav.append(InlineKeyboardButton(text="Previous", callback_data=f"net:rank:{visibility}:{page - 1}"))
+        if page + 1 < total_pages:
+            nav.append(InlineKeyboardButton(text="Next", callback_data=f"net:rank:{visibility}:{page + 1}"))
+        if nav:
+            controls.append(nav)
+        controls.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="Top private channels" if is_public else "Top public channels",
+                        callback_data=f"net:rank:{'private' if is_public else 'public'}:0",
+                    )
+                ],
+                [InlineKeyboardButton(text="Back to Network", callback_data="net:home")],
+            ]
+        )
         await self._render(message, "\n".join(lines), _markup(controls))
 
     async def _show_top_channels(self, message: Message, limit: int) -> None:
@@ -2836,8 +2911,21 @@ class OwnerHandlers:
                 if result["other"]:
                     notice += f"\nOther outcomes: {result['other']}"
             await self._show_network(query.message, notice=notice)
+        elif parts[1] == "refresh_all":
+            run, created = await self.repositories.start_network_refresh(query.from_user.id)
+            await self._show_network(
+                query.message,
+                notice=(
+                    f"Full network refresh queued for {int(run.get('total', 0))} channels. "
+                    "It runs in the background at a safe Telegram API rate; open Network again to see live progress."
+                    if created
+                    else "A full network refresh is already running. Open Network again to see its live progress."
+                ),
+            )
         elif parts[1] == "list" and len(parts) == 4:
             await self._show_network_list(query.message, parts[2], int(parts[3]))
+        elif parts[1] == "rank" and len(parts) == 4:
+            await self._show_ranked_channels(query.message, parts[2], int(parts[3]))
         elif parts[1] == "top" and len(parts) == 3:
             await self._show_top_channels(query.message, int(parts[2]))
         else:

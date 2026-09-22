@@ -21,6 +21,7 @@ from app.db.leases import LeaseManager
 from app.db.repositories import Repositories
 from app.delivery.rate_limit import AsyncTokenBucket
 from app.delivery.worker import DeliveryWorker
+from app.network.refresh_worker import ChannelRefreshWorker
 from app.telegram.handlers_admin_updates import ChannelAdminHandlers
 from app.telegram.handlers_client_requests import ClientRequestHandlers
 from app.telegram.handlers_join_events import JoinEventHandlers
@@ -136,6 +137,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 interval_hours=settings.auto_backup_interval_hours,
             )
             runtime.tasks.append(asyncio.create_task(backup_worker.run(runtime.stopping), name="automatic-backup"))
+            refresh_worker = ChannelRefreshWorker(
+                worker_id=f"{instance_id}-network-refresh",
+                bot=bot,
+                repositories=repositories,
+                request_limiter=mutation_limiter,
+                lease_seconds=settings.delivery_lease_seconds,
+                max_attempts=settings.max_transient_attempts,
+            )
+            runtime.tasks.append(asyncio.create_task(refresh_worker.run(runtime.stopping), name="network-refresh"))
             for number in range(settings.broadcast_workers):
                 worker = DeliveryWorker(
                     worker_id=f"{instance_id}-{number}",
