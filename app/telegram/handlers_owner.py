@@ -1134,24 +1134,32 @@ class OwnerHandlers:
             f"Can post: {'yes' if permissions.get('can_post_messages') else 'no'}\n"
             f"Tags: {', '.join(channel.get('tags', [])) or 'none'}"
         )
+        owner = channel.get("owner_account") or {}
+        if owner:
+            owner_name = owner.get("display_name") or "Unnamed account"
+            owner_username = f" (@{owner['username']})" if owner.get("username") else ""
+            text += f"\nOwner account: {owner_name}{owner_username} • ID {owner.get('telegram_user_id', 'unknown')}"
+        else:
+            text += "\nOwner account: not verified yet — Refresh access to check it."
         enabled = channel.get("status") != "INACTIVE_MANUAL"
+        rows = [
+            [
+                InlineKeyboardButton(text="Refresh access", callback_data=f"chan:{chat_id}:refresh"),
+                InlineKeyboardButton(text="Tag", callback_data=f"chan:{chat_id}:tag"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Pause source" if enabled else "Enable source", callback_data=f"chan:{chat_id}:{'disable' if enabled else 'enable'}"
+                )
+            ],
+        ]
+        if channel.get("access_link"):
+            rows.append([InlineKeyboardButton(text="Open channel", url=channel["access_link"])])
+        rows.append([InlineKeyboardButton(text="Back to Network", callback_data="net:home")])
         await self._render(
             message,
             text,
-            _markup(
-                [
-                    [
-                        InlineKeyboardButton(text="Refresh access", callback_data=f"chan:{chat_id}:refresh"),
-                        InlineKeyboardButton(text="Tag", callback_data=f"chan:{chat_id}:tag"),
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Pause source" if enabled else "Enable source", callback_data=f"chan:{chat_id}:{'disable' if enabled else 'enable'}"
-                        )
-                    ],
-                    [InlineKeyboardButton(text="Back to Network", callback_data="net:home")],
-                ]
-            ),
+            _markup(rows),
         )
 
     async def _show_button_editor(self, message: Message, campaign: Document, variant_index: int) -> None:

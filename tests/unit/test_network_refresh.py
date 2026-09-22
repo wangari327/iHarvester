@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.enums import ChatMemberStatus
@@ -6,6 +7,7 @@ from aiogram.enums import ChatMemberStatus
 from app.campaigns.models import ChannelStatus
 from app.network.refresh_worker import ChannelRefreshWorker
 from app.telegram.handlers_admin_updates import refresh_channel
+from app.telegram.handlers_owner import OwnerHandlers
 
 
 class NoopLimiter:
@@ -27,6 +29,14 @@ class RefreshBot:
 
     async def get_chat_member_count(self, chat_id):
         return 1234
+
+    async def get_chat_administrators(self, chat_id):
+        return [
+            SimpleNamespace(
+                status=ChatMemberStatus.CREATOR,
+                user=SimpleNamespace(id=77, first_name="Account", last_name="One", username="account_one"),
+            )
+        ]
 
 
 class RefreshRepositories:
@@ -67,7 +77,10 @@ async def test_full_refresh_keeps_a_manually_paused_channel_paused() -> None:
     assert active is False
     assert repositories.upserted["status"] == ChannelStatus.INACTIVE_MANUAL.value
     assert repositories.upserted["member_count"] == 1234
-    assert limiter.calls == 3
+    assert repositories.upserted["access_link"] == "https://t.me/c/1/1"
+    assert repositories.upserted["owner_account"]["telegram_user_id"] == 77
+    assert repositories.upserted["owner_account"]["username"] == "account_one"
+    assert limiter.calls == 4
 
 
 @pytest.mark.asyncio
@@ -93,3 +106,29 @@ async def test_network_refresh_worker_records_a_completed_job(monkeypatch) -> No
     assert repositories.completed == [
         ("job", "COMPLETED", {"observed_status": "INACTIVE_MANUAL", "member_count": None, "access_verified": True})
     ]
+
+
+@pytest.mark.asyncio
+async def test_channel_details_show_owner_identity_and_open_link() -> None:
+    handlers = OwnerHandlers.__new__(OwnerHandlers)
+    handlers.repositories = SimpleNamespace(
+        get_channel=AsyncMock(
+            return_value={
+                "telegram_chat_id": -1001,
+                "title": "Private channel",
+                "status": "ACTIVE",
+                "member_count": 1234,
+                "permissions": {"can_post_messages": True},
+                "access_link": "https://t.me/c/1/1",
+                "owner_account": {"telegram_user_id": 77, "display_name": "Account One", "username": "account_one"},
+            }
+        )
+    )
+    handlers._render = AsyncMock()
+
+    await handlers._show_channel(object(), -1001)
+
+    _, text, markup = handlers._render.await_args.args
+    assert "Owner account: Account One (@account_one) • ID 77" in text
+    open_button = next(button for row in markup.inline_keyboard for button in row if button.text == "Open channel")
+    assert open_button.url == "https://t.me/c/1/1"

@@ -70,6 +70,32 @@ async def refresh_channel(
         if is_admin and can_post
         else ChannelStatus.UNAVAILABLE
     )
+    owner_account: dict[str, Any] | None = None
+    try:
+        administrators = await request(bot.get_chat_administrators(chat_id))
+        owner_member = next(
+            (item for item in administrators if item.status == ChatMemberStatus.CREATOR),
+            None,
+        )
+        if owner_member:
+            owner_user = owner_member.user
+            owner_account = {
+                "telegram_user_id": owner_user.id,
+                "display_name": " ".join(part for part in (owner_user.first_name, owner_user.last_name) if part).strip(),
+                "username": owner_user.username,
+                "verified_at": utcnow(),
+            }
+    except Exception:
+        # Member counts and posting permission are still useful even when
+        # Telegram will not disclose the administrator roster to this bot.
+        owner_account = None
+    access_link = (
+        f"https://t.me/{chat.username}"
+        if chat.username
+        else f"https://t.me/c/{str(chat.id)[4:]}/1"
+        if str(chat.id).startswith("-100")
+        else None
+    )
     await repositories.upsert_channel(
         {
             "telegram_chat_id": chat.id,
@@ -77,6 +103,7 @@ async def refresh_channel(
             "username": chat.username,
             "type": "channel",
             "is_public": bool(chat.username),
+            "access_link": access_link,
             "member_count": member_count,
             "status": status.value,
             "permissions": {
@@ -86,6 +113,7 @@ async def refresh_channel(
                 "can_invite_users": bool(getattr(member, "can_invite_users", False)),
             },
             "last_verified_at": utcnow(),
+            **({"owner_account": owner_account} if owner_account else {}),
         }
     )
     return status == ChannelStatus.ACTIVE
