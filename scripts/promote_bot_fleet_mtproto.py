@@ -36,7 +36,7 @@ except ImportError as error:  # pragma: no cover - operator environment only
 
 
 logger = logging.getLogger("iharvester.bot_fleet")
-SUCCESS_STATES = {"ADDED", "ALREADY_ADMIN"}
+SUCCESS_STATES = {"ADDED", "UPDATED", "ALREADY_ADMIN"}
 TERMINAL_STATES = {*SUCCESS_STATES, "FAILED", "CANCELLED"}
 
 
@@ -264,14 +264,18 @@ async def _already_admin(session: OwnerSession, channel: Any, bot: Any) -> bool:
 
 
 def _fleet_rights() -> Any:
-    """Posting/editing only; all channel-management and delegation powers stay off."""
-    return types.ChatAdminRights(post_messages=True, edit_messages=True)
+    """Operational post/link rights, without channel control or delegation."""
+    return types.ChatAdminRights(
+        post_messages=True,
+        edit_messages=True,
+        delete_messages=True,
+        invite_users=True,
+    )
 
 
 async def _promote_one(session: OwnerSession, channel: Any, username: str, cache: dict[tuple[str, str], Any]) -> str:
     bot = await _bot_input(session, username, cache)
-    if await _already_admin(session, channel, bot):
-        return "ALREADY_ADMIN"
+    already_admin = await _already_admin(session, channel, bot)
     await session.client(
         functions.channels.EditAdminRequest(
             channel=channel,
@@ -280,7 +284,10 @@ async def _promote_one(session: OwnerSession, channel: Any, username: str, cache
             rank="",
         )
     )
-    return "ADDED"
+    # EditAdmin is deliberately also sent for existing fleet admins: it brings
+    # an old, restrictive grant up to this worker's current safe capability
+    # profile (including Invite Users via Link) without granting add-admins.
+    return "UPDATED" if already_admin else "ADDED"
 
 
 def _pending_results(job: dict[str, Any]) -> list[dict[str, Any]]:
@@ -291,9 +298,9 @@ def _final_status(job: dict[str, Any]) -> str:
     states = Counter(str(result.get("status") or "PENDING") for result in job.get("results", []))
     if states["PENDING"]:
         return "RUNNING"
-    if states["CANCELLED"] and not (states["ADDED"] or states["ALREADY_ADMIN"] or states["FAILED"]):
+    if states["CANCELLED"] and not (states["ADDED"] or states["UPDATED"] or states["ALREADY_ADMIN"] or states["FAILED"]):
         return "CANCELLED"
-    if states["FAILED"] and not (states["ADDED"] or states["ALREADY_ADMIN"]):
+    if states["FAILED"] and not (states["ADDED"] or states["UPDATED"] or states["ALREADY_ADMIN"]):
         return "FAILED"
     return "COMPLETED" if not states["FAILED"] and not states["CANCELLED"] else "PARTIAL"
 

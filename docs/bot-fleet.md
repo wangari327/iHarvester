@@ -10,7 +10,7 @@ The Bot API cannot promote unrelated bots. A small private worker therefore runs
 2. Verifies that any resolved peer is the requested channel ID.
 3. Uses only an account Telegram permits to grant administrators; this requires Telegram's **Add admins** permission.
 4. Promotes only the approved fleet bots, sequentially and with a delay.
-5. Grants only **post messages** and **edit messages** rights. It does not grant deletion, invitations, channel management, or the ability to add other administrators.
+5. Grants **post messages**, **edit messages**, **delete messages**, and **Invite Users via Link** rights. It does not grant channel-management or the ability to add other administrators.
 
 The worker never logs in, exports, or deletes a human session. It does not need any bot token for the fleet bots.
 

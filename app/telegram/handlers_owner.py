@@ -964,7 +964,7 @@ class OwnerHandlers:
                 completed = sum(
                     1
                     for result in results
-                    if result.get("status") in {"ADDED", "ALREADY_ADMIN", "FAILED", "CANCELLED"}
+                    if result.get("status") in {"ADDED", "UPDATED", "ALREADY_ADMIN", "FAILED", "CANCELLED"}
                 )
                 recent_lines.append(
                     f"â€¢ {job.get('channel_title', job.get('channel_id'))}: {str(job.get('status', 'UNKNOWN')).replace('_', ' ').title()} "
@@ -978,8 +978,8 @@ class OwnerHandlers:
             + f"Approved bots: {len(self.fleet_usernames)}\n"
             + "Choose one registered channel at a time. iHarvester must already be its administrator. "
             + "A private authorised human-account worker then uses only an account which already sees that exact channel and has Add admins permission.\n\n"
-            + "Every fleet bot receives posting and editing rights only. They do not receive channel-management, "
-            + "invite, deletion, or administrator-delegation rights.\n\n"
+            + "Every fleet bot receives posting, editing, deletion, and Invite Users via Link rights. They do not "
+            + "receive channel-management or administrator-delegation rights.\n\n"
             + f"Recent jobs\n{recent}",
             _markup(
                 [
@@ -1001,7 +1001,7 @@ class OwnerHandlers:
             return
         results = list(job.get("results", []))
         counts = self._fleet_job_counts(job)
-        done = sum(counts[state] for state in ("ADDED", "ALREADY_ADMIN", "FAILED", "CANCELLED"))
+        done = sum(counts[state] for state in ("ADDED", "UPDATED", "ALREADY_ADMIN", "FAILED", "CANCELLED"))
         title = str(job.get("channel_title") or job.get("channel_id"))
         channel_username = job.get("channel_username")
         destination = f"@{channel_username}" if channel_username else "private channel"
@@ -1011,7 +1011,7 @@ class OwnerHandlers:
             "",
             f"Channel: {title} ({destination})",
             f"Progress: {done}/{len(results)} complete",
-            f"Added: {counts['ADDED']}  |  Already admin: {counts['ALREADY_ADMIN']}",
+            f"Added: {counts['ADDED']}  |  Permissions updated: {counts['UPDATED']}  |  Already admin: {counts['ALREADY_ADMIN']}",
             f"Waiting: {counts['PENDING']}  |  Failed: {counts['FAILED']}  |  Cancelled: {counts['CANCELLED']}",
         ]
         if job.get("started_at"):
@@ -1049,7 +1049,7 @@ class OwnerHandlers:
         for index, job in enumerate(jobs, start=page * page_size + 1):
             counts = self._fleet_job_counts(job)
             results = list(job.get("results", []))
-            complete = sum(counts[state] for state in ("ADDED", "ALREADY_ADMIN", "FAILED", "CANCELLED"))
+            complete = sum(counts[state] for state in ("ADDED", "UPDATED", "ALREADY_ADMIN", "FAILED", "CANCELLED"))
             lines.append(
                 f"{index}. {job.get('channel_title', job.get('channel_id'))} â€” "
                 f"{str(job.get('status', 'UNKNOWN')).replace('_', ' ').title()} ({complete}/{len(results)})"
@@ -3309,7 +3309,7 @@ class OwnerHandlers:
                 f"Ready to add {len(self.fleet_usernames)} approved bots to:\n"
                 f"{channel.get('title', channel_id)} ({username})\n\n"
                 "The private worker will use only an authorised human account that already has this exact channel and Add admins permission. "
-                "Each fleet bot receives posting and editing rights only. Confirm to queue it.",
+                "Each fleet bot receives post, edit, delete, and Invite Users via Link rights. Confirm to queue it.",
                 reply_markup=_markup(
                     [
                         [InlineKeyboardButton(text="Confirm add bot fleet", callback_data=f"fleet:confirm:{channel_id}")],
