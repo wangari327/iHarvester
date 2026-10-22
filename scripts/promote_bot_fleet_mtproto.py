@@ -3,9 +3,10 @@
 
 This is intentionally a private recovery-VPS worker, never part of the Koyeb
 image.  The main bot only creates a compact ``bot_fleet_jobs`` document after
-its owner confirms a channel.  For every job this worker loads each existing
-human account's Telegram dialog directory, uses only an account which already
-has that exact channel, and grants the approved bots *post and edit* rights.
+its owner confirms a channel.  For every job this worker resolves the exact
+stored channel ID with each existing human session (using the registered public
+username when present), verifies that ID, and grants the approved bots *post
+and edit* rights only through an account Telegram permits to add administrators.
 
 It never searches channel history, signs in an account, exports a session, or
 adds any bot not listed on the job.  Existing sessions remain on the VPS.
@@ -41,7 +42,7 @@ TERMINAL_STATES = {*SUCCESS_STATES, "FAILED", "CANCELLED"}
 
 @dataclass
 class OwnerSession:
-    """One authorised human account and channel input peers it already knows."""
+    """One authorised human account and its exact, verified channel peers."""
 
     path: Path
     client: TelegramClient
@@ -65,8 +66,37 @@ def _channel_id(entity: Any) -> int:
     return -1_000_000_000_000 - int(entity.id)
 
 
-async def _open_sessions(paths: list[Path], api_id: int, api_hash: str) -> list[OwnerSession]:
-    """Open pre-authorised humans and read only their dialog directories."""
+async def _resolve_channel(client: TelegramClient, channel_id: int, username: str | None) -> Any | None:
+    """Resolve a known channel peer without reading its messages or history."""
+    expected_id = -channel_id - 1_000_000_000_000
+    if username:
+        try:
+            entity = await client.get_entity(username)
+        except (errors.FloodWaitError, errors.RPCError, ValueError):
+            entity = None
+        if isinstance(entity, types.Channel) and int(entity.id) == expected_id:
+            access_hash = getattr(entity, "access_hash", None)
+            if isinstance(access_hash, int):
+                return types.InputChannel(expected_id, access_hash)
+    try:
+        peer = await client.get_input_entity(channel_id)
+    except (errors.FloodWaitError, errors.RPCError, ValueError):
+        return None
+    if getattr(peer, "channel_id", None) != expected_id:
+        return None
+    access_hash = getattr(peer, "access_hash", None)
+    return types.InputChannel(expected_id, access_hash) if isinstance(access_hash, int) else None
+
+
+async def _open_sessions(
+    paths: list[Path],
+    api_id: int,
+    api_hash: str,
+    *,
+    channel_id: int,
+    channel_username: str | None,
+) -> list[OwnerSession]:
+    """Open pre-authorised humans and resolve only the requested exact peer."""
     opened: list[OwnerSession] = []
     for position, path in enumerate(paths, start=1):
         client = TelegramClient(
@@ -82,22 +112,14 @@ async def _open_sessions(paths: list[Path], api_id: int, api_hash: str) -> list[
             identity = await client.get_me()
             if not identity or identity.bot:
                 raise RuntimeError("not an authorised human account")
-            dialogs = await client.get_dialogs(limit=None)
-            channels: dict[int, Any] = {}
-            for dialog in dialogs:
-                entity = dialog.entity
-                if not isinstance(entity, types.Channel):
-                    continue
-                access_hash = getattr(entity, "access_hash", None)
-                if isinstance(access_hash, int):
-                    channels[_channel_id(entity)] = types.InputChannel(int(entity.id), access_hash)
+            peer = await _resolve_channel(client, channel_id, channel_username)
+            channels = {channel_id: peer} if peer else {}
             label = f"authorised account {position}"
-            logger.info("%s: loaded %s known channels", label, len(channels))
+            logger.info("%s: exact channel resolved=%s", label, bool(peer))
             opened.append(OwnerSession(path=path, client=client, label=label, channels=channels))
         except errors.FloodWaitError as error:
-            # Do not make guesses from MongoDB or public usernames.  The next
-            # timer pass can reopen this exact owner directory after Telegram's
-            # requested cooldown while other accounts remain usable.
+            # The next timer pass can retry after Telegram's requested cooldown
+            # while other accounts remain usable.
             await client.disconnect()
             logger.warning("%s: dialog directory cooling down for %ss", path.name, error.seconds)
         except Exception:
@@ -287,10 +309,10 @@ async def _run_job(database: Any, job: dict[str, Any], sessions: list[OwnerSessi
                 job_id,
                 str(result["username"]),
                 status="FAILED",
-                error="no authorised human session currently has this exact channel in its Telegram directory",
+                error="no authorised human session could resolve this exact channel peer",
             )
         _finish_job(database, job_id, status="FAILED")
-        logger.warning("%s: no authorised session has channel %s", job_id, channel_id)
+        logger.warning("%s: no authorised session could resolve channel %s", job_id, channel_id)
         return
 
     cache: dict[tuple[str, str], Any] = {}
@@ -403,7 +425,13 @@ async def run(args: argparse.Namespace) -> int:
             logger.info("No fleet jobs waiting.")
             return 0
         try:
-            sessions = await _open_sessions(session_paths, api_id, api_hash)
+            sessions = await _open_sessions(
+                session_paths,
+                api_id,
+                api_hash,
+                channel_id=int(job["channel_id"]),
+                channel_username=job.get("channel_username"),
+            )
         except Exception:
             _defer_job(database, str(job["job_id"]), 300, "could not open authorised Telegram session directory")
             raise
@@ -417,9 +445,19 @@ async def run(args: argparse.Namespace) -> int:
             completed += 1
             if args.once:
                 return 0
+            for session in sessions:
+                await session.client.disconnect()
+            sessions = []
             job = _claim_job(database, worker_id, args.lease_seconds)
             if not job:
                 return 0
+            sessions = await _open_sessions(
+                session_paths,
+                api_id,
+                api_hash,
+                channel_id=int(job["channel_id"]),
+                channel_username=job.get("channel_username"),
+            )
     finally:
         for session in sessions:
             await session.client.disconnect()

@@ -6,9 +6,9 @@ It adds the configured approved bot usernames to **one channel at a time**. The 
 
 The Bot API cannot promote unrelated bots. A small private worker therefore runs on the recovery VPS using the three already-authorised human Telegram sessions. For each job it:
 
-1. Reads each authorised account's dialog directory, without inspecting channel history.
-2. Uses only an account that already has the exact target channel in that directory.
-3. Requires that account to have Telegram's **Add admins** permission.
+1. Resolves the exact stored channel ID for each authorised account, using the registered public username when available, without inspecting channel history.
+2. Verifies that any resolved peer is the requested channel ID.
+3. Uses only an account Telegram permits to grant administrators; this requires Telegram's **Add admins** permission.
 4. Promotes only the approved fleet bots, sequentially and with a delay.
 5. Grants only **post messages** and **edit messages** rights. It does not grant deletion, invitations, channel management, or the ability to add other administrators.
 
