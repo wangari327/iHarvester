@@ -10,7 +10,7 @@ The Bot API cannot promote unrelated bots. A small private worker therefore runs
 2. Verifies that any resolved peer is the requested channel ID.
 3. Uses only an account Telegram permits to grant administrators; this requires Telegram's **Add admins** permission.
 4. Promotes only the approved fleet bots, sequentially and with a delay.
-5. Grants **post messages**, **edit messages**, **delete messages**, and **Invite Users via Link** rights. It does not grant channel-management or the ability to add other administrators.
+5. Requests **post messages**, **edit messages**, **delete messages**, and **Invite Users via Link** rights. Telegram only permits a human administrator to delegate rights it already holds, so a limited acting account grants its valid subset and the job records the omitted rights. It never grants channel-management or the ability to add other administrators.
 
 The worker never logs in, exports, or deletes a human session. It does not need any bot token for the fleet bots.
 
@@ -38,4 +38,4 @@ Use `--dry-run` to list waiting fleet jobs without opening Telegram or writing d
 
 The repository includes ready-to-copy systemd units in [`deploy/iharvester-bot-fleet.service`](../deploy/iharvester-bot-fleet.service) and [`deploy/iharvester-bot-fleet.timer`](../deploy/iharvester-bot-fleet.timer). They use the existing VPS-only environment and preserved session paths, run one channel per invocation, and take a non-blocking lock so they never overlap.
 
-If every authorised account lacks **Add admins** in a chosen channel, the job safely fails without changing the channel. Grant that right to one of the three human accounts and create a fresh job from the Bot fleet screen.
+If every authorised account lacks **Add admins** in a chosen channel, the job safely fails without changing the channel. For the complete fleet profile, at least one authorised account must itself hold **Add admins**, **Post messages**, **Edit messages**, **Delete messages**, and **Invite Users via Link**. If it has only **Add admins** and **Invite Users via Link**, the worker can still add the fleet and grant invite-link access, but it cannot legally grant the other three rights.

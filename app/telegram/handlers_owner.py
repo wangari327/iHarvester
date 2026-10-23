@@ -978,8 +978,9 @@ class OwnerHandlers:
             + f"Approved bots: {len(self.fleet_usernames)}\n"
             + "Choose one registered channel at a time. iHarvester must already be its administrator. "
             + "A private authorised human-account worker then uses only an account which already sees that exact channel and has Add admins permission.\n\n"
-            + "Every fleet bot receives posting, editing, deletion, and Invite Users via Link rights. They do not "
-            + "receive channel-management or administrator-delegation rights.\n\n"
+            + "The worker requests posting, editing, deletion, and Invite Users via Link rights. Telegram only allows an "
+            + "acting account to delegate rights it already holds, so a deliberately limited account grants its available "
+            + "subset and the job records it. Fleet bots never receive channel-management or administrator-delegation rights.\n\n"
             + f"Recent jobs\n{recent}",
             _markup(
                 [
@@ -1022,7 +1023,7 @@ class OwnerHandlers:
         for result in results:
             label = f"@{result.get('username', 'unknown')}"
             state = str(result.get("status") or "PENDING").replace("_", " ").title()
-            detail = str(result.get("error") or "").strip()
+            detail = str(result.get("error") or result.get("note") or "").strip()
             summary.append(f"â€¢ {label}: {state}" + (f" â€” {detail[:90]}" if detail else ""))
         controls: list[list[InlineKeyboardButton]] = [
             [InlineKeyboardButton(text="Refresh status", callback_data=f"fleet:job:{job_id}")],
@@ -3309,7 +3310,8 @@ class OwnerHandlers:
                 f"Ready to add {len(self.fleet_usernames)} approved bots to:\n"
                 f"{channel.get('title', channel_id)} ({username})\n\n"
                 "The private worker will use only an authorised human account that already has this exact channel and Add admins permission. "
-                "Each fleet bot receives post, edit, delete, and Invite Users via Link rights. Confirm to queue it.",
+                "The worker requests post, edit, delete, and Invite Users via Link rights. Telegram will grant only the "
+                "subset the acting account is allowed to delegate, and the result will show it. Confirm to queue it.",
                 reply_markup=_markup(
                     [
                         [InlineKeyboardButton(text="Confirm add bot fleet", callback_data=f"fleet:confirm:{channel_id}")],

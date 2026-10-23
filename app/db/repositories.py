@@ -331,6 +331,7 @@ class Repositories:
                     "status": "PENDING",
                     "account_label": None,
                     "error": None,
+                    "note": None,
                     "updated_at": now,
                 }
                 for username in bot_usernames

@@ -5,8 +5,8 @@ This is intentionally a private recovery-VPS worker, never part of the Koyeb
 image.  The main bot only creates a compact ``bot_fleet_jobs`` document after
 its owner confirms a channel.  For every job this worker resolves the exact
 stored channel ID with each existing human session (using the registered public
-username when present), verifies that ID, and grants the approved bots *post
-and edit* rights only through an account Telegram permits to add administrators.
+username when present), verifies that ID, and grants the approved bots only the
+operational rights that the acting account can legally delegate.
 
 It never searches channel history, signs in an account, exports a session, or
 adds any bot not listed on the job.  Existing sessions remain on the VPS.
@@ -38,6 +38,13 @@ except ImportError as error:  # pragma: no cover - operator environment only
 logger = logging.getLogger("iharvester.bot_fleet")
 SUCCESS_STATES = {"ADDED", "UPDATED", "ALREADY_ADMIN"}
 TERMINAL_STATES = {*SUCCESS_STATES, "FAILED", "CANCELLED"}
+FLEET_RIGHT_FIELDS = ("post_messages", "edit_messages", "delete_messages", "invite_users")
+FLEET_RIGHT_LABELS = {
+    "post_messages": "Post messages",
+    "edit_messages": "Edit messages",
+    "delete_messages": "Delete messages",
+    "invite_users": "Invite Users via Link",
+}
 
 
 @dataclass
@@ -49,6 +56,15 @@ class OwnerSession:
     label: str
     channels: dict[int, Any] = field(default_factory=dict)
     cooldown_until: float = 0.0
+
+
+@dataclass(frozen=True)
+class DelegableProfile:
+    """Fleet rights one acting human account may legally delegate."""
+
+    rights: Any
+    granted: tuple[str, ...]
+    unavailable: tuple[str, ...]
 
 
 def _required_env(name: str) -> str:
@@ -167,6 +183,7 @@ def _save_result(
     status: str,
     account_label: str | None = None,
     error: str | None = None,
+    note: str | None = None,
 ) -> None:
     database.bot_fleet_jobs.update_one(
         {"job_id": job_id, "results.username": username},
@@ -175,6 +192,7 @@ def _save_result(
                 "results.$.status": status,
                 "results.$.account_label": account_label,
                 "results.$.error": error,
+                "results.$.note": note,
                 "results.$.updated_at": _utcnow(),
                 "updated_at": _utcnow(),
             }
@@ -248,8 +266,8 @@ async def _bot_input(session: OwnerSession, username: str, cache: dict[tuple[str
     return input_user
 
 
-async def _already_admin(session: OwnerSession, channel: Any, bot: Any) -> bool:
-    """Avoid overwriting an existing fleet bot's deliberately chosen rights."""
+async def _existing_admin_rights(session: OwnerSession, channel: Any, bot: Any) -> Any | None:
+    """Return an existing fleet admin's rights without modifying it."""
     try:
         response = await session.client(
             functions.channels.GetParticipantRequest(
@@ -258,36 +276,90 @@ async def _already_admin(session: OwnerSession, channel: Any, bot: Any) -> bool:
             )
         )
     except errors.UserNotParticipantError:
-        return False
+        return None
     participant = getattr(response, "participant", None)
-    return isinstance(participant, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator))
+    if isinstance(participant, types.ChannelParticipantCreator):
+        return _fleet_rights(FLEET_RIGHT_FIELDS)
+    if isinstance(participant, types.ChannelParticipantAdmin):
+        return getattr(participant, "admin_rights", None)
+    return None
 
 
-def _fleet_rights() -> Any:
-    """Operational post/link rights, without channel control or delegation."""
-    return types.ChatAdminRights(
-        post_messages=True,
-        edit_messages=True,
-        delete_messages=True,
-        invite_users=True,
-    )
+def _fleet_rights(fields: tuple[str, ...]) -> Any:
+    """Build a minimal operational grant without channel control or delegation."""
+    return types.ChatAdminRights(**{field: True for field in fields})
 
 
-async def _promote_one(session: OwnerSession, channel: Any, username: str, cache: dict[tuple[str, str], Any]) -> str:
+async def _delegable_profile(session: OwnerSession, channel: Any) -> DelegableProfile | None:
+    """Return only rights Telegram permits this human to pass to a fleet bot.
+
+    Telegram does not treat ``Add admins`` as a blanket right: an administrator
+    may only delegate administrator permissions that they hold themselves.  A
+    creator can delegate the complete fleet profile; an intentionally limited
+    administrator can still add a fleet bot with the useful subset it holds.
+    """
+    try:
+        response = await session.client(
+            functions.channels.GetParticipantRequest(channel=channel, participant=types.InputPeerSelf())
+        )
+    except errors.UserNotParticipantError:
+        return None
+    participant = getattr(response, "participant", None)
+    if isinstance(participant, types.ChannelParticipantCreator):
+        granted = FLEET_RIGHT_FIELDS
+    elif isinstance(participant, types.ChannelParticipantAdmin):
+        actor_rights = getattr(participant, "admin_rights", None)
+        if not bool(getattr(actor_rights, "add_admins", False)):
+            return None
+        granted = tuple(field for field in FLEET_RIGHT_FIELDS if bool(getattr(actor_rights, field, False)))
+    else:
+        return None
+    if not granted:
+        return None
+    unavailable = tuple(field for field in FLEET_RIGHT_FIELDS if field not in granted)
+    return DelegableProfile(rights=_fleet_rights(granted), granted=granted, unavailable=unavailable)
+
+
+def _profile_note(profile: DelegableProfile) -> str | None:
+    """Explain a deliberately limited but successful grant to the owner."""
+    if not profile.unavailable:
+        return None
+    granted = ", ".join(FLEET_RIGHT_LABELS[field] for field in profile.granted)
+    unavailable = ", ".join(FLEET_RIGHT_LABELS[field] for field in profile.unavailable)
+    return f"Granted: {granted}. Not delegated: {unavailable} (the acting account does not hold those rights)."
+
+
+async def _promote_one(
+    session: OwnerSession,
+    channel: Any,
+    username: str,
+    cache: dict[tuple[str, str], Any],
+    profile: DelegableProfile,
+) -> tuple[str, str | None]:
     bot = await _bot_input(session, username, cache)
-    already_admin = await _already_admin(session, channel, bot)
+    existing_rights = await _existing_admin_rights(session, channel, bot)
+    if existing_rights:
+        existing = {field for field in FLEET_RIGHT_FIELDS if bool(getattr(existing_rights, field, False))}
+        requested = set(profile.granted)
+        if requested.issubset(existing):
+            return "ALREADY_ADMIN", _profile_note(profile)
+        if existing - requested:
+            return (
+                "ALREADY_ADMIN",
+                "Existing fleet administrator was left unchanged because this acting account cannot safely edit its broader permission set.",
+            )
     await session.client(
         functions.channels.EditAdminRequest(
             channel=channel,
             user_id=bot,
-            admin_rights=_fleet_rights(),
+            admin_rights=profile.rights,
             rank="",
         )
     )
-    # EditAdmin is deliberately also sent for existing fleet admins: it brings
-    # an old, restrictive grant up to this worker's current safe capability
-    # profile (including Invite Users via Link) without granting add-admins.
-    return "UPDATED" if already_admin else "ADDED"
+    # If an existing bot has no broader grant, this safely fills in rights that
+    # the actor can delegate. Never replace a broader existing profile with a
+    # narrower one merely because this actor is intentionally limited.
+    return ("UPDATED" if existing_rights else "ADDED"), _profile_note(profile)
 
 
 def _pending_results(job: dict[str, Any]) -> list[dict[str, Any]]:
@@ -322,6 +394,41 @@ async def _run_job(database: Any, job: dict[str, Any], sessions: list[OwnerSessi
         logger.warning("%s: no authorised session could resolve channel %s", job_id, channel_id)
         return
 
+    # A public username can be resolved by an account that is not actually a
+    # member of its channel.  Check the acting account directly before it ever
+    # reaches EditAdmin, and calculate the exact rights Telegram lets it pass.
+    eligible: list[tuple[OwnerSession, DelegableProfile]] = []
+    for session in candidates:
+        try:
+            profile = await _delegable_profile(session, session.channels[channel_id])
+        except errors.FloodWaitError as error:
+            session.cooldown_until = asyncio.get_running_loop().time() + int(error.seconds) + 2
+            logger.warning("%s: %s is cooling down for %ss during permission preflight", job_id, session.label, error.seconds)
+            continue
+        except errors.RPCError as error:
+            logger.warning("%s: could not inspect %s rights: %s", job_id, session.label, error)
+            continue
+        if profile:
+            eligible.append((session, profile))
+            logger.info(
+                "%s: %s can delegate %s",
+                job_id,
+                session.label,
+                ", ".join(FLEET_RIGHT_LABELS[field] for field in profile.granted),
+            )
+    if not eligible:
+        for result in _pending_results(job):
+            _save_result(
+                database,
+                job_id,
+                str(result["username"]),
+                status="FAILED",
+                error="no authorised account can both Add admins and delegate a fleet operational permission in this channel",
+            )
+        _finish_job(database, job_id, status="FAILED")
+        logger.warning("%s: no authorised account can delegate fleet rights", job_id)
+        return
+
     cache: dict[tuple[str, str], Any] = {}
     offset = 0
     for pending in _pending_results(job):
@@ -332,25 +439,30 @@ async def _run_job(database: Any, job: dict[str, Any], sessions: list[OwnerSessi
             return
         _heartbeat(database, job_id, args.lease_seconds)
         username = str(pending["username"])
-        usable = sorted(
-            candidates,
-            key=lambda session: (session.cooldown_until > asyncio.get_running_loop().time(), (candidates.index(session) - offset) % len(candidates)),
-        )
         promoted = False
         cooldowns: list[float] = []
         permission_denied = 0
         last_error: str | None = None
-        for session in usable:
+        for step in range(len(eligible)):
+            candidate_index = (offset + step) % len(eligible)
+            session, profile = eligible[candidate_index]
             remaining = session.cooldown_until - asyncio.get_running_loop().time()
             if remaining > 0:
                 cooldowns.append(remaining)
                 continue
             try:
-                outcome = await _promote_one(session, session.channels[channel_id], username, cache)
-                _save_result(database, job_id, username, status=outcome, account_label=session.label)
+                outcome, note = await _promote_one(session, session.channels[channel_id], username, cache, profile)
+                _save_result(
+                    database,
+                    job_id,
+                    username,
+                    status=outcome,
+                    account_label=session.label,
+                    note=note,
+                )
                 logger.info("%s: %s %s using %s", job_id, outcome.lower(), username, session.label)
                 promoted = True
-                offset = (candidates.index(session) + 1) % len(candidates)
+                offset = (candidate_index + 1) % len(eligible)
                 break
             except errors.FloodWaitError as error:
                 wait_seconds = int(error.seconds) + 2
@@ -375,17 +487,17 @@ async def _run_job(database: Any, job: dict[str, Any], sessions: list[OwnerSessi
                 last_error = f"unexpected worker error: {error.__class__.__name__}"
                 logger.exception("%s: could not promote %s", job_id, username)
         if not promoted:
-            if cooldowns and len(cooldowns) >= len(candidates):
+            if cooldowns and len(cooldowns) >= len(eligible):
                 _defer_job(database, job_id, int(min(cooldowns)), "waiting for Telegram flood cooldown")
                 logger.info("%s: deferred until a cooled-down authorised account is available", job_id)
                 return
-            if permission_denied == len(candidates):
+            if permission_denied == len(eligible):
                 _save_result(
                     database,
                     job_id,
                     username,
                     status="FAILED",
-                    error="none of the authorised accounts in this channel has Add admins permission",
+                    error="the authorised account lost its fleet-administration rights while this job was running",
                 )
             else:
                 _save_result(database, job_id, username, status="FAILED", error=last_error or "Telegram could not promote this bot")
