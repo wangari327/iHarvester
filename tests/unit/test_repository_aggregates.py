@@ -137,6 +137,25 @@ async def test_status_aggregates_await_cursor_before_reading_rows() -> None:
 
 
 @pytest.mark.asyncio
+async def test_safety_refresh_ignores_unpostable_and_previously_attempted_live_states() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    cutoff = datetime.now(UTC) - timedelta(hours=1)
+    collection = AsyncCollection([{"updated_at": cutoff + timedelta(minutes=1)}])
+    repositories = Repositories.__new__(Repositories)
+    repositories.db = SimpleNamespace(campaign_channel_state=collection)
+
+    assert await repositories.oldest_live_state_updated_at("cmp", since=cutoff) == cutoff + timedelta(minutes=1)
+    pipeline = collection.pipeline
+    assert pipeline[0] == {"$match": {"campaign_id": "cmp", "updated_at": {"$gt": cutoff}}}
+    assert pipeline[1]["$lookup"]["from"] == "channels"
+    assert pipeline[2]["$match"]["channel"]["$elemMatch"] == {
+        "status": "ACTIVE",
+        "permissions.can_post_messages": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_ending_cancels_future_sends_but_never_cleanup_jobs() -> None:
     """Regression: 1,643 live posts matched 1,643 cancelled cleanup jobs."""
     deliveries = CleanupDeliveryCollection()
