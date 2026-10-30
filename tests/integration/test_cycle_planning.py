@@ -26,8 +26,10 @@ class MemoryRepositories:
     async def get_campaign(self, campaign_id):
         return self.campaign if campaign_id == self.campaign["campaign_id"] else None
 
-    async def oldest_live_state_updated_at(self, campaign_id):
+    async def oldest_live_state_updated_at(self, campaign_id, *, since=None):
         assert campaign_id == self.campaign["campaign_id"]
+        if since is not None and self.oldest_live_at is not None and self.oldest_live_at <= since:
+            return None
         return self.oldest_live_at
 
     async def create_cycle(self, cycle, deliveries):
@@ -285,6 +287,56 @@ async def test_scheduler_refreshes_an_ageing_post_before_telegram_cleanup_expire
     # safety post, so stale missed reposts are not dumped into the network.
     assert campaign["next_cycle_number"] == 2
     assert campaign["next_cycle_at"] == campaign["current_end_at_utc"]
+
+
+@pytest.mark.asyncio
+async def test_stale_unreachable_post_cannot_repeat_a_whole_network_safety_refresh() -> None:
+    now = datetime.now(UTC)
+    campaign = {
+        "campaign_id": "cmp_stale_safety",
+        "status": "ACTIVE",
+        "mode": "STANDARD",
+        "start_at_utc": now - timedelta(hours=45),
+        "current_end_at_utc": now + timedelta(days=2),
+        "repost_interval_seconds": 47 * 60 * 60,
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"x" * 32).decode(),
+        "variants": [{"id": "var_1", "kind": "TEXT", "text": "Fresh post"}],
+        "next_cycle_number": 1,
+        "delete_on_end": True,
+    }
+    repositories = MemoryRepositories(campaign, [{"telegram_chat_id": -1001}])
+    repositories.oldest_live_at = now - timedelta(hours=45)
+    service = CampaignService(repositories, send_rps=20)
+    assert await service.plan_due_cycle(campaign, now)
+    assert campaign["cleanup_safety_refresh_count"] == 1
+    assert not await service.plan_due_cycle(campaign, now + timedelta(minutes=30))
+    assert len(repositories.cycles) == 1
+
+
+@pytest.mark.asyncio
+async def test_newly_refreshed_post_can_still_receive_later_safety_refresh() -> None:
+    now = datetime.now(UTC)
+    campaign = {
+        "campaign_id": "cmp_refresh_again",
+        "status": "ACTIVE",
+        "mode": "STANDARD",
+        "start_at_utc": now - timedelta(days=5),
+        "current_end_at_utc": now + timedelta(hours=10),
+        "repost_interval_seconds": 47 * 60 * 60,
+        "target_snapshot": [-1001],
+        "cohort_map": {"-1001": 0},
+        "shuffle_seed": base64.urlsafe_b64encode(b"x" * 32).decode(),
+        "variants": [{"id": "var_1", "kind": "TEXT", "text": "Fresh post"}],
+        "next_cycle_number": 4,
+        "delete_on_end": True,
+        "cleanup_safety_last_refresh_at": now - timedelta(hours=46),
+    }
+    repositories = MemoryRepositories(campaign, [{"telegram_chat_id": -1001}])
+    repositories.oldest_live_at = now - timedelta(hours=45)
+    assert await CampaignService(repositories, send_rps=20).plan_due_cycle(campaign, now)
+    assert repositories.deliveries[0]["safety_refresh"] is True
 
 
 @pytest.mark.asyncio
