@@ -953,14 +953,29 @@ class Repositories:
         rows = await cursor.to_list(None)
         return {str(row["_id"]): int(row["count"]) for row in rows}
 
-    async def oldest_live_state_updated_at(self, campaign_id: str) -> Any | None:
-        """Oldest confirmed campaign post, used to stay inside Telegram's delete window."""
-        state = await self.db.campaign_channel_state.find_one(
-            {"campaign_id": campaign_id},
-            {"updated_at": 1},
-            sort=[("updated_at", ASCENDING)],
+    async def oldest_live_state_updated_at(self, campaign_id: str, *, since: Any | None = None) -> Any | None:
+        """Oldest refreshable post not already covered by an emergency refresh.
+
+        A stale pointer on a channel in NEEDS_ATTENTION must remain for final
+        cleanup/recovery, but must never cause endless full-network reposts.
+        The last-attempt cutoff also prevents an unreachable channel that was
+        active during a refresh from continually triggering new cycles.
+        """
+        match: Document = {"campaign_id": campaign_id}
+        if since is not None:
+            match["updated_at"] = {"$gt": as_utc(since)}
+        cursor = await self.db.campaign_channel_state.aggregate(
+            [
+                {"$match": match},
+                {"$lookup": {"from": "channels", "localField": "channel_id", "foreignField": "telegram_chat_id", "as": "channel"}},
+                {"$match": {"channel": {"$elemMatch": {"status": "ACTIVE", "permissions.can_post_messages": True}}}},
+                {"$sort": {"updated_at": 1}},
+                {"$limit": 1},
+                {"$project": {"updated_at": 1}},
+            ]
         )
-        return state.get("updated_at") if state else None
+        rows = await cursor.to_list(1)
+        return rows[0].get("updated_at") if rows else None
 
     async def mark_campaign_archived(self, campaign_id: str, reason: str) -> None:
         await self.db.campaigns.update_one(
