@@ -76,9 +76,12 @@ class DeleteCollection:
         return DeleteResult(self.deleted_count)
 
 
-def deletion_repositories(*, live_count: int = 0) -> tuple[Repositories, SimpleNamespace]:
+def deletion_repositories(*, live_count: int = 0, cleanup_finalization: str | None = None) -> tuple[Repositories, SimpleNamespace]:
+    campaign = {"campaign_id": "cmp", "status": "ARCHIVED"}
+    if cleanup_finalization:
+        campaign["cleanup_finalization"] = cleanup_finalization
     db = SimpleNamespace(
-        campaigns=DeleteCollection(document={"campaign_id": "cmp", "status": "ARCHIVED"}, deleted_count=1),
+        campaigns=DeleteCollection(document=campaign, deleted_count=1),
         campaign_cycles=DeleteCollection(),
         deliveries=DeleteCollection(),
         join_events=DeleteCollection(),
@@ -120,3 +123,15 @@ async def test_archived_deletion_is_blocked_while_retained_posts_are_live() -> N
     assert not db.deliveries.deleted_many
     assert not db.join_events.deleted_many
     assert not db.campaigns.deleted_one
+
+
+@pytest.mark.asyncio
+async def test_archived_deletion_allows_owner_finalized_unresolved_cleanup() -> None:
+    repositories, db = deletion_repositories(
+        live_count=3,
+        cleanup_finalization="UNRESOLVED_AFTER_OWNER_RETRY",
+    )
+
+    assert await repositories.delete_archived_campaign("cmp")
+    assert db.campaign_channel_state.deleted_many == [{"campaign_id": "cmp"}]
+    assert db.campaigns.deleted_one == [{"campaign_id": "cmp", "status": "ARCHIVED"}]

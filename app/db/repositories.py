@@ -953,19 +953,65 @@ class Repositories:
         rows = await cursor.to_list(None)
         return {str(row["_id"]): int(row["count"]) for row in rows}
 
-    async def oldest_live_state_updated_at(self, campaign_id: str) -> Any | None:
-        """Oldest confirmed campaign post, used to stay inside Telegram's delete window."""
-        state = await self.db.campaign_channel_state.find_one(
-            {"campaign_id": campaign_id},
-            {"updated_at": 1},
-            sort=[("updated_at", ASCENDING)],
-        )
-        return state.get("updated_at") if state else None
+    async def oldest_live_state_updated_at(self, campaign_id: str, *, since: Any | None = None) -> Any | None:
+        """Oldest refreshable post not already covered by an emergency refresh.
 
-    async def mark_campaign_archived(self, campaign_id: str, reason: str) -> None:
+        A stale pointer on a channel in NEEDS_ATTENTION must remain for final
+        cleanup/recovery, but must never cause endless full-network reposts.
+        The last-attempt cutoff also prevents an unreachable channel that was
+        active during a refresh from continually triggering new cycles.
+        """
+        match: Document = {"campaign_id": campaign_id}
+        if since is not None:
+            match["updated_at"] = {"$gt": as_utc(since)}
+        cursor = await self.db.campaign_channel_state.aggregate(
+            [
+                {"$match": match},
+                {"$lookup": {"from": "channels", "localField": "channel_id", "foreignField": "telegram_chat_id", "as": "channel"}},
+                {"$match": {"channel": {"$elemMatch": {"status": "ACTIVE", "permissions.can_post_messages": True}}}},
+                {"$sort": {"updated_at": 1}},
+                {"$limit": 1},
+                {"$project": {"updated_at": 1}},
+            ]
+        )
+        rows = await cursor.to_list(1)
+        return rows[0].get("updated_at") if rows else None
+
+    async def mark_campaign_archived(
+        self,
+        campaign_id: str,
+        reason: str,
+        *,
+        cleanup_unresolved: bool = False,
+    ) -> None:
+        now = utcnow()
+        update: Document = {
+            "$set": {
+                "status": "ARCHIVED",
+                "archived_at": now,
+                "end_reason": reason,
+                "updated_at": now,
+            }
+        }
+        if cleanup_unresolved:
+            # Set only after an owner-requested retry has settled. This marks a
+            # completed campaign with inaccessible residual posts, not an
+            # interrupted cleanup which the scheduler should recover.
+            update["$set"].update(
+                {
+                    "cleanup_finalization": "UNRESOLVED_AFTER_OWNER_RETRY",
+                    "cleanup_finalized_at": now,
+                }
+            )
+        else:
+            update["$unset"] = {
+                "cleanup_finalization": "",
+                "cleanup_finalized_at": "",
+                "cleanup_final_retry_requested_at": "",
+            }
         await self.db.campaigns.update_one(
             {"campaign_id": campaign_id},
-            {"$set": {"status": "ARCHIVED", "archived_at": utcnow(), "end_reason": reason}},
+            update,
         )
 
     async def mark_campaign_ending(self, campaign_id: str, reason: str) -> bool:
@@ -987,7 +1033,12 @@ class Repositories:
                     "end_reason": "retained_posts_cleanup",
                     "ending_at": utcnow(),
                     "updated_at": utcnow(),
-                }
+                },
+                "$unset": {
+                    "cleanup_finalization": "",
+                    "cleanup_finalized_at": "",
+                    "cleanup_final_retry_requested_at": "",
+                },
             },
         )
         changed = result.modified_count == 1
@@ -1212,6 +1263,7 @@ class Repositories:
                     "campaign_id": campaign_id,
                     "status": "ARCHIVED",
                     "delete_on_end": True,
+                    "cleanup_finalization": {"$ne": "UNRESOLVED_AFTER_OWNER_RETRY"},
                 },
                 {
                     "$set": {
@@ -1301,6 +1353,38 @@ class Repositories:
         )
         return outstanding == 0
 
+    async def cleanup_retry_has_reached_terminal_state(self, campaign_id: str) -> bool:
+        """Whether a final owner-requested cleanup retry has settled unresolved.
+
+        Telegram can permanently refuse deletion when a channel was sold or
+        banned, the bot lost rights, the message was manually removed, or a
+        deletion policy applies. Once the owner has asked for one final retry,
+        keep that evidence but allow the campaign lifecycle to finish.
+
+        Delivery-level markers preserve compatibility with campaigns that were
+        already stuck before the campaign-level marker was introduced.
+        """
+        outstanding = await self.db.deliveries.count_documents(
+            {
+                "campaign_id": campaign_id,
+                "operation": "CLEANUP",
+                "status": {"$in": ["PENDING", "PROCESSING", "RETRY_WAIT"]},
+            },
+            limit=1,
+        )
+        if outstanding:
+            return False
+        unresolved_after_owner_retry = await self.db.deliveries.count_documents(
+            {
+                "campaign_id": campaign_id,
+                "operation": "CLEANUP",
+                "status": DeliveryStatus.CLEANUP_FAILED.value,
+                "owner_retry_requested_at": {"$exists": True},
+            },
+            limit=1,
+        )
+        return unresolved_after_owner_retry > 0
+
     async def retry_failed_cleanup_deliveries(self, campaign_id: str) -> int:
         """Owner-requested retry for permanent cleanup failures only."""
         now = utcnow()
@@ -1324,6 +1408,16 @@ class Repositories:
                     "updated_at": now,
                     "owner_retry_requested_at": now,
                 }
+            },
+        )
+        # Keep the owner's intent on the campaign too. The delivery marker
+        # supports legacy campaigns; this field makes the final retry explicit
+        # in current campaign records.
+        await self.db.campaigns.update_one(
+            {"campaign_id": campaign_id, "status": "ENDING"},
+            {
+                "$set": {"cleanup_final_retry_requested_at": now, "updated_at": now},
+                "$unset": {"cleanup_finalization": "", "cleanup_finalized_at": ""},
             },
         )
         return result.modified_count
@@ -2156,7 +2250,8 @@ class Repositories:
         if not campaign:
             return False
         live_count = await self.db.campaign_channel_state.count_documents({"campaign_id": campaign_id})
-        if live_count:
+        cleanup_unresolved = campaign.get("cleanup_finalization") == "UNRESOLVED_AFTER_OWNER_RETRY"
+        if live_count and not cleanup_unresolved:
             raise ValueError(f"this campaign still tracks {live_count} live post{'s' if live_count != 1 else ''}; delete retained posts first")
 
         campaign_query = {"campaign_id": campaign_id}

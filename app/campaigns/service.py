@@ -568,7 +568,13 @@ class CampaignService:
         """
         if not campaign.get("delete_on_end", True):
             return False
-        oldest_live_at = await self.repositories.oldest_live_state_updated_at(campaign["campaign_id"])
+        # An unreachable channel can retain an old live-post pointer even after
+        # the previous full-network safety cycle completes. Never let that same
+        # pointer trigger another full-network refresh: only posts refreshed or
+        # discovered *after* the last attempt can be considered again.
+        oldest_live_at = await self.repositories.oldest_live_state_updated_at(
+            campaign["campaign_id"], since=campaign.get("cleanup_safety_last_refresh_at")
+        )
         if not oldest_live_at:
             return False
         safe_deadline = as_utc(oldest_live_at) + SAFE_DELETE_WINDOW

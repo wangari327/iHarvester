@@ -94,3 +94,15 @@ class Scheduler:
         # intentional live-state pointers keep them stuck at ENDING forever.
         if not delete_on_end or await self.repositories.cleanup_is_complete(campaign["campaign_id"]):
             await self.repositories.mark_campaign_archived(campaign["campaign_id"], campaign.get("end_reason", "ended"))
+            return
+
+        # Once the owner has explicitly retried cleanup and that attempt has
+        # settled, a sold/banned/inaccessible channel must not trap a campaign
+        # in ENDING forever. Preserve the cleanup record for audit and a later
+        # retry, but complete the campaign so it can be copied or removed.
+        if await self.repositories.cleanup_retry_has_reached_terminal_state(campaign["campaign_id"]):
+            await self.repositories.mark_campaign_archived(
+                campaign["campaign_id"],
+                campaign.get("end_reason", "ended"),
+                cleanup_unresolved=True,
+            )

@@ -388,11 +388,14 @@ async def test_live_text_repair_skips_a_post_replaced_by_a_newer_cycle() -> None
 
 
 class EndingRepositories:
-    def __init__(self, quiescent):
+    def __init__(self, quiescent, *, cleanup_complete=True, terminal_after_retry=False):
         self.quiescent = quiescent
+        self.cleanup_complete = cleanup_complete
+        self.terminal_after_retry = terminal_after_retry
         self.materialized = 0
         self.archived = 0
         self.cleanup_checked = 0
+        self.archived_with = {}
 
     async def cancel_pending_campaign_deliveries(self, campaign_id):
         return None
@@ -408,10 +411,14 @@ class EndingRepositories:
 
     async def cleanup_is_complete(self, campaign_id):
         self.cleanup_checked += 1
-        return True
+        return self.cleanup_complete
 
-    async def mark_campaign_archived(self, campaign_id, reason):
+    async def cleanup_retry_has_reached_terminal_state(self, campaign_id):
+        return self.terminal_after_retry
+
+    async def mark_campaign_archived(self, campaign_id, reason, **kwargs):
         self.archived += 1
+        self.archived_with = kwargs
 
 
 @pytest.mark.asyncio
@@ -454,6 +461,25 @@ async def test_retained_campaign_archives_without_waiting_for_its_intentional_li
     assert repositories.materialized == 0
     assert repositories.cleanup_checked == 0
     assert repositories.archived == 1
+
+
+@pytest.mark.asyncio
+async def test_ending_archives_after_the_owner_retry_settles_with_unresolved_posts() -> None:
+    repositories = EndingRepositories(quiescent=True, cleanup_complete=False, terminal_after_retry=True)
+    scheduler = Scheduler(
+        instance_id="instance",
+        repositories=repositories,
+        lease_manager=None,
+        campaign_service=None,
+        lease_seconds=30,
+        tick_seconds=1,
+    )
+
+    await scheduler._finish_ending_campaign({"campaign_id": "cmp", "status": "ENDING", "delete_on_end": True})
+
+    assert repositories.materialized == 1
+    assert repositories.archived == 1
+    assert repositories.archived_with == {"cleanup_unresolved": True}
 
 
 @pytest.mark.asyncio

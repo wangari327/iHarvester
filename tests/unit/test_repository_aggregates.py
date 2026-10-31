@@ -137,6 +137,25 @@ async def test_status_aggregates_await_cursor_before_reading_rows() -> None:
 
 
 @pytest.mark.asyncio
+async def test_safety_refresh_ignores_unpostable_and_previously_attempted_live_states() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    cutoff = datetime.now(UTC) - timedelta(hours=1)
+    collection = AsyncCollection([{"updated_at": cutoff + timedelta(minutes=1)}])
+    repositories = Repositories.__new__(Repositories)
+    repositories.db = SimpleNamespace(campaign_channel_state=collection)
+
+    assert await repositories.oldest_live_state_updated_at("cmp", since=cutoff) == cutoff + timedelta(minutes=1)
+    pipeline = collection.pipeline
+    assert pipeline[0] == {"$match": {"campaign_id": "cmp", "updated_at": {"$gt": cutoff}}}
+    assert pipeline[1]["$lookup"]["from"] == "channels"
+    assert pipeline[2]["$match"]["channel"]["$elemMatch"] == {
+        "status": "ACTIVE",
+        "permissions.can_post_messages": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_ending_cancels_future_sends_but_never_cleanup_jobs() -> None:
     """Regression: 1,643 live posts matched 1,643 cancelled cleanup jobs."""
     deliveries = CleanupDeliveryCollection()
@@ -206,6 +225,28 @@ async def test_cleanup_cannot_report_complete_while_any_post_is_still_live() -> 
 
 
 @pytest.mark.asyncio
+async def test_owner_cleanup_retry_can_finish_with_unresolved_posts_after_work_settles() -> None:
+    deliveries = CountCollection([0, 1])
+    repositories = Repositories.__new__(Repositories)
+    repositories.db = SimpleNamespace(deliveries=deliveries)
+
+    assert await repositories.cleanup_retry_has_reached_terminal_state("cmp")
+    assert deliveries.queries[0][0]["status"] == {"$in": ["PENDING", "PROCESSING", "RETRY_WAIT"]}
+    assert deliveries.queries[1][0]["status"] == "CLEANUP_FAILED"
+    assert deliveries.queries[1][0]["owner_retry_requested_at"] == {"$exists": True}
+
+
+@pytest.mark.asyncio
+async def test_owner_cleanup_retry_does_not_finish_while_cleanup_work_is_still_active() -> None:
+    deliveries = CountCollection([1])
+    repositories = Repositories.__new__(Repositories)
+    repositories.db = SimpleNamespace(deliveries=deliveries)
+
+    assert not await repositories.cleanup_retry_has_reached_terminal_state("cmp")
+    assert len(deliveries.queries) == 1
+
+
+@pytest.mark.asyncio
 async def test_false_success_archive_with_cancelled_cleanup_is_reopened_automatically() -> None:
     campaigns = RecoverableCampaigns()
     repositories = Repositories.__new__(Repositories)
@@ -221,6 +262,7 @@ async def test_false_success_archive_with_cancelled_cleanup_is_reopened_automati
         "campaign_id": "cmp_archived",
         "status": "ARCHIVED",
         "delete_on_end": True,
+        "cleanup_finalization": {"$ne": "UNRESOLVED_AFTER_OWNER_RETRY"},
     }
     assert update["$set"]["status"] == "ENDING"
     assert update["$set"]["end_reason"] == "cleanup_recovery"
