@@ -225,6 +225,28 @@ async def test_cleanup_cannot_report_complete_while_any_post_is_still_live() -> 
 
 
 @pytest.mark.asyncio
+async def test_owner_cleanup_retry_can_finish_with_unresolved_posts_after_work_settles() -> None:
+    deliveries = CountCollection([0, 1])
+    repositories = Repositories.__new__(Repositories)
+    repositories.db = SimpleNamespace(deliveries=deliveries)
+
+    assert await repositories.cleanup_retry_has_reached_terminal_state("cmp")
+    assert deliveries.queries[0][0]["status"] == {"$in": ["PENDING", "PROCESSING", "RETRY_WAIT"]}
+    assert deliveries.queries[1][0]["status"] == "CLEANUP_FAILED"
+    assert deliveries.queries[1][0]["owner_retry_requested_at"] == {"$exists": True}
+
+
+@pytest.mark.asyncio
+async def test_owner_cleanup_retry_does_not_finish_while_cleanup_work_is_still_active() -> None:
+    deliveries = CountCollection([1])
+    repositories = Repositories.__new__(Repositories)
+    repositories.db = SimpleNamespace(deliveries=deliveries)
+
+    assert not await repositories.cleanup_retry_has_reached_terminal_state("cmp")
+    assert len(deliveries.queries) == 1
+
+
+@pytest.mark.asyncio
 async def test_false_success_archive_with_cancelled_cleanup_is_reopened_automatically() -> None:
     campaigns = RecoverableCampaigns()
     repositories = Repositories.__new__(Repositories)
@@ -240,6 +262,7 @@ async def test_false_success_archive_with_cancelled_cleanup_is_reopened_automati
         "campaign_id": "cmp_archived",
         "status": "ARCHIVED",
         "delete_on_end": True,
+        "cleanup_finalization": {"$ne": "UNRESOLVED_AFTER_OWNER_RETRY"},
     }
     assert update["$set"]["status"] == "ENDING"
     assert update["$set"]["end_reason"] == "cleanup_recovery"

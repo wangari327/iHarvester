@@ -303,6 +303,7 @@ def campaign_keyboard(
     *,
     variant_count: int = 0,
     has_live_posts: bool = False,
+    has_cleanup_issues: bool = False,
     has_schedule: bool = False,
 ) -> InlineKeyboardMarkup:
     if status == CampaignStatus.ARCHIVED.value:
@@ -314,6 +315,8 @@ def campaign_keyboard(
         ]
         if has_live_posts:
             rows.append([InlineKeyboardButton(text="Delete retained posts", callback_data=f"c:{campaign_id}:cleanup")])
+        if has_cleanup_issues:
+            rows.append([InlineKeyboardButton(text="View cleanup issues", callback_data=f"c:{campaign_id}:failures")])
         rows.append([InlineKeyboardButton(text="Delete campaign history", callback_data=f"c:{campaign_id}:delete")])
         rows.append(
             [
@@ -780,14 +783,16 @@ class OwnerHandlers:
             if latest_live_repair.get("repair_id")
             else {}
         )
+        cleanup_finalized_with_unresolved = campaign.get("cleanup_finalization") == "UNRESOLVED_AFTER_OWNER_RETRY"
+        show_cleanup_status = status == CampaignStatus.ENDING.value or cleanup_finalized_with_unresolved
         cleanup_statuses = (
             await self.repositories.cleanup_status_summary(campaign["campaign_id"])
-            if status == CampaignStatus.ENDING.value
+            if show_cleanup_status
             else {}
         )
         cleanup_failures_by_category = (
             await self.repositories.cleanup_failure_summary(campaign["campaign_id"])
-            if status == CampaignStatus.ENDING.value
+            if show_cleanup_status
             else {}
         )
         join_count = await self.repositories.campaign_join_count(campaign["campaign_id"])
@@ -889,12 +894,17 @@ class OwnerHandlers:
             else:
                 repair_text = "Live text repair: no current posts matched this variant.\n"
         cleanup_text = ""
-        if status == CampaignStatus.ENDING.value:
+        if show_cleanup_status:
             cleanup_waiting = sum(cleanup_statuses.get(item, 0) for item in ("PENDING", "PROCESSING", "RETRY_WAIT"))
             blocked = cleanup_statuses.get("CLEANUP_FAILED", 0)
             cleanup_text = (
                 f"Cleanup: {live_count} tracked posts live  |  {cleanup_waiting} queued/retrying  |  {blocked} blocked\n"
             )
+            if cleanup_finalized_with_unresolved:
+                cleanup_text += (
+                    "Cleanup was retried and finished with unresolved posts. The campaign is complete; "
+                    "you can copy, rerun, retry cleanup later, or delete its history.\n"
+                )
             if cleanup_failures_by_category:
                 labels = {
                     "ACCESS_OR_PERMISSION": "access",
@@ -948,7 +958,13 @@ class OwnerHandlers:
             f"{latest_text}\n"
             f"Campaign time: {timeline}  |  Run time: {run_time}\n\n"
             f"State: {phase}.",
-            campaign_keyboard(campaign["campaign_id"], status, variant_count=len(variants), has_live_posts=live_count > 0),
+            campaign_keyboard(
+                campaign["campaign_id"],
+                status,
+                variant_count=len(variants),
+                has_live_posts=live_count > 0,
+                has_cleanup_issues=cleanup_finalized_with_unresolved,
+            ),
         )
 
     async def _show_bot_fleet(self, message: Message, owner_id: int, *, notice: str | None = None) -> None:
@@ -2118,7 +2134,8 @@ class OwnerHandlers:
                 )
             elif campaign["status"] == CampaignStatus.ARCHIVED.value:
                 live_count = await self.repositories.campaign_live_state_count(campaign_id)
-                if live_count:
+                cleanup_finalized_with_unresolved = campaign.get("cleanup_finalization") == "UNRESOLVED_AFTER_OWNER_RETRY"
+                if live_count and not cleanup_finalized_with_unresolved:
                     await query.message.answer(
                         f"This past campaign still tracks {live_count} live post{'s' if live_count != 1 else ''}. "
                         "Delete the retained posts before removing its history.",
@@ -2130,9 +2147,15 @@ class OwnerHandlers:
                         ),
                     )
                 else:
+                    warning = (
+                        f" This campaign still has {live_count} unresolved Telegram post{'s' if live_count != 1 else ''}; "
+                        "removing its history cannot delete those posts."
+                        if cleanup_finalized_with_unresolved and live_count
+                        else ""
+                    )
                     await query.message.answer(
                         "Permanently delete this past campaign? Its campaign definition, delivery report, cycle history, failures, and join statistics "
-                        "will be removed. This cannot be undone.",
+                        f"will be removed. This cannot be undone.{warning}",
                         reply_markup=_markup(
                             [
                                 [
